@@ -1,0 +1,10 @@
+folium
+geopandas
+numpy
+pandas
+pyarrow
+requests
+shapely
+fiona
+pyproj
+rtree
