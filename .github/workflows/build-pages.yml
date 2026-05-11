@@ -1,0 +1,53 @@
+name: Build and publish map
+
+on:
+  workflow_dispatch:
+    inputs:
+      code_insee:
+        description: "Code INSEE à traiter"
+        required: true
+        default: "93048"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build map
+        env:
+          CODE_INSEE: ${{ inputs.code_insee }}
+          CHEMIN_MAJIC: data/majic.parquet
+          OUTPUT_HTML: docs/index.html
+          OUTPUT_GEOJSON: docs/opportunites.geojson
+        run: |
+          python run_fusion_github.py
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
