@@ -29,7 +29,7 @@ CHEMIN_MAJIC  = os.environ.get('CHEMIN_MAJIC', 'data/majic.parquet')
 CHEMIN_LOCAUX = os.environ.get('CHEMIN_LOCAUX', 'data/locaux.parquet')
 
 # Signal Fort — score minimum pour afficher le ping rouge
-SIGNAL_FORT_SEUIL = 2   # 2 signaux cumulés = ping rouge
+ALERTE_MIN_SEUIL = 1   # 1 signal = ! | 2 signaux = !!
 
 # Dents creuses
 HAUT_MAX_DC         = 7.0
@@ -63,8 +63,8 @@ NATURES_OK = ['Maison','Terrain','Sol',
 
 # Couleurs
 COUL_DC     = '#E8820C'
-COUL_VIDE   = '#2563EB'
-COUL_SOUS   = '#7C3AED'
+COUL_VIDE   = '#16A34A'
+COUL_SOUS   = '#EAB308'
 COUL_FRICHE = '#DC2626'
 COUL_VACANT = '#92400E'
 
@@ -659,16 +659,15 @@ total_affiche = len(dc_parc) + len(vides) + len(sous) + len(gdf_friches)
 print(f'\n✅ Total affiché : {total_affiche} opportunités (hors vacants Signal Fort)')
 
 # ══════════════════════════════════════════════════════
-# SIGNAL FORT — score par cumul de signaux
+# ALERTE COMPLÉMENTAIRE — score simple
 #
 # +1  Aucune vente DVF depuis 2014
 # +1  Démembrement (nu-proprio + usufruitier)
-# +1  Répertorié dans Cartofriches
-# +1  Pleine propriété société (SIREN connu)
 #
-# Seuil : SIGNAL_FORT_SEUIL signaux → ping rouge
+# 1 point  = !
+# 2 points = !!
 # ══════════════════════════════════════════════════════
-print('Calcul Signal Fort...')
+print('Calcul alertes complémentaires...')
 
 # Fix 3 — Récupérer la clé cadastrale des friches via jointure spatiale
 # Cartofriches ne contient pas de clé parcelle — on la retrouve
@@ -691,41 +690,26 @@ if len(gdf_friches) > 0:
 # Fix 4 — Score différencié selon la catégorie
 # Les vacants sont déjà filtrés par DVF=0 → ce signal ne les discrimine pas
 # On ne le compte donc que pour les autres catégories
-def score_signal_fort(cle, siren='', compter_dvf=True):
+def score_signal_fort(cle, compter_dvf=True):
     score = 0
     if compter_dvf and cle not in cles_avec_mutation:
         score += 1
     if cle in cles_demembrement:
-        score += 1  # Succession potentiellement bloquée
-    if cle in cles_friches:
-        score += 1  # Répertoriée comme friche
-    if siren and str(siren) not in ('', 'nan'):
-        score += 1  # Propriétaire société identifiée
-    # Note : cles_multi_sans_synd affiché dans le popup mais pas compté dans le score
+        score += 1
     return score
 
 def ajouter_score(df, compter_dvf=True):
     df = df.copy()
     df['signal_fort_score'] = df.apply(
-        lambda r: score_signal_fort(
-            r.get('cle', ''), r.get('siren', ''), compter_dvf
-        ), axis=1
+        lambda r: score_signal_fort(r.get('cle', ''), compter_dvf), axis=1
     )
-    df['signal_fort'] = df['signal_fort_score'] >= SIGNAL_FORT_SEUIL
+    df['signal_fort'] = df['signal_fort_score'] >= ALERTE_MIN_SEUIL
+    df['signal_fort_badge'] = df['signal_fort_score'].map({1: '!', 2: '!!'}).fillna('')
     return df
 
-dc_parc      = ajouter_score(dc_parc,      compter_dvf=True)
-vides        = ajouter_score(vides,         compter_dvf=True)
-sous         = ajouter_score(sous,          compter_dvf=True)
-parc_vacants = ajouter_score(parc_vacants,  compter_dvf=False)  # déjà filtré
-
-nb_fort = int(sum([
-    dc_parc['signal_fort'].sum(),
-    vides['signal_fort'].sum(),
-    sous['signal_fort'].sum(),
-    parc_vacants['signal_fort'].sum()
-]))
-print(f'✅ {nb_fort} biens avec Signal Fort (≥{SIGNAL_FORT_SEUIL} signaux)')
+dc_parc = ajouter_score(dc_parc, compter_dvf=True)
+vides   = ajouter_score(vides,   compter_dvf=True)
+sous    = ajouter_score(sous,    compter_dvf=True)
 
 
 def geocoder_df(df):
@@ -781,6 +765,43 @@ if len(gdf_friches) > 0:
     gdf_friches = geocoder_df(gdf_friches)
 print('✅ Adresses récupérées')
 
+# Associer chaque friche à sa parcelle cadastrale pour l'afficher
+# comme une vraie grande catégorie rouge, au même titre que les autres.
+friche_parc_map = {}
+if len(gdf_friches) > 0:
+    try:
+        fr_pts = gdf_friches.to_crs(epsg=2154).copy()
+        fr_pts['friche_idx'] = list(fr_pts.index)
+        fr_pts['geometry'] = fr_pts.geometry.centroid
+        fr_join = gpd.sjoin(
+            fr_pts[['friche_idx', 'geometry']],
+            parcelles[['cle', 'section', 'numero', 'contenance', 'geometry']],
+            how='left', predicate='within'
+        ).drop(columns='index_right', errors='ignore')
+        parc_geom_fri = parcelles[['cle', 'geometry']].rename(columns={'geometry': 'geom_parcelle'})
+        fr_join = fr_join.merge(parc_geom_fri, on='cle', how='left')
+        friche_parc_map = fr_join.set_index('friche_idx').to_dict('index')
+    except Exception as e:
+        print(f'  ⚠️ Association friches/parcelles échouée : {e}')
+
+# Score d'alerte sur les friches via leur parcelle associée
+if len(gdf_friches) > 0:
+    gdf_friches = gdf_friches.copy()
+    gdf_friches['cle'] = gdf_friches.index.map(lambda i: friche_parc_map.get(i, {}).get('cle', ''))
+    gdf_friches = ajouter_score(gdf_friches, compter_dvf=True)
+else:
+    gdf_friches['signal_fort_score'] = []
+    gdf_friches['signal_fort'] = []
+    gdf_friches['signal_fort_badge'] = []
+
+nb_fort = int(sum([
+    dc_parc['signal_fort'].sum(),
+    vides['signal_fort'].sum(),
+    sous['signal_fort'].sum(),
+    gdf_friches['signal_fort'].sum() if 'signal_fort' in gdf_friches.columns else 0
+]))
+print(f'✅ {nb_fort} biens avec alerte complémentaire (! ou !!)')
+
 
 def niveau(h):
     if h <= 0:
@@ -809,23 +830,24 @@ folium.TileLayer(
     attr='© IGN', name='Parcelles IGN', overlay=True, control=True, opacity=0.55
 ).add_to(carte)
 
-# CSS animation ping rouge — injecté une seule fois dans la page
+# CSS badge alerte rose — injecté une seule fois dans la page
 carte.get_root().html.add_child(folium.Element("""
 <style>
-@keyframes ping {
-  0%   { transform: scale(1);   opacity: 1; }
-  80%  { transform: scale(2.5); opacity: 0; }
-  100% { transform: scale(2.5); opacity: 0; }
-}
-.ping-rouge {
-  width: 14px; height: 14px;
-  background: #DC2626;
+.badge-alerte {
+  width: 18px; height: 18px;
+  background: #EC4899;
+  color: white;
   border-radius: 50%;
   border: 2px solid white;
-  box-shadow: 0 0 0 0 rgba(220,38,38,0.6);
-  animation: ping 1.4s ease-out infinite;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: Arial;
+  font-size: 12px;
+  font-weight: bold;
+  box-shadow: 0 1px 6px rgba(0,0,0,0.35);
   position: absolute;
-  top: -18px; left: -7px;
+  top: -20px; left: -9px;
   pointer-events: none;
   z-index: 9999;
 }
@@ -836,10 +858,36 @@ fg_dc  = folium.FeatureGroup(name=f'🟠 Dents creuses ({len(dc_parc)})', show=T
 fg_vid = folium.FeatureGroup(name=f'🔵 Terrains vides stricts ({len(vides)})', show=True)
 fg_sou = folium.FeatureGroup(name=f'🟣 Sous-exploités filtrés ({len(sous)})', show=True)
 fg_fri = folium.FeatureGroup(name=f'🔴 Friches ({len(gdf_friches)})', show=True)
-fg_fort = folium.FeatureGroup(name=f'🚨 Signal Fort ({nb_fort})', show=True)
+fg_fort = folium.FeatureGroup(name=f'🩷 Alertes complémentaires ({nb_fort})', show=True)
 
 
-def ajouter(fg, gp, lat, lon, coul, col_f, icone, html, tip, sec, num, fort=False, fg_fort_ref=None):
+def ajouter_alerte(lat, lon, fg_fort_ref, badge='!', html=None, tooltip=None):
+    if fg_fort_ref is None or not badge:
+        return
+    badge_html = f'<div class="badge-alerte">{badge}</div>'
+    if html:
+        folium.Marker(
+            [lat, lon],
+            popup=folium.Popup(html, max_width=330),
+            tooltip=tooltip or 'Alerte complémentaire',
+            icon=folium.DivIcon(
+                html=badge_html,
+                icon_size=(18, 18),
+                icon_anchor=(9, 30)
+            )
+        ).add_to(fg_fort_ref)
+    else:
+        folium.Marker(
+            [lat, lon],
+            icon=folium.DivIcon(
+                html=badge_html,
+                icon_size=(18, 18),
+                icon_anchor=(9, 30)
+            )
+        ).add_to(fg_fort_ref)
+
+
+def ajouter(fg, gp, lat, lon, coul, col_f, icone, html, tip, sec, num, fort=False, badge='', fg_fort_ref=None):
     geom_wgs = gpd.GeoSeries([gp], crs='EPSG:2154').to_crs('EPSG:4326').iloc[0]
     folium.GeoJson(
         geom_wgs.__geo_interface__,
@@ -862,17 +910,8 @@ def ajouter(fg, gp, lat, lon, coul, col_f, icone, html, tip, sec, num, fort=Fals
             icon_size=(60,18), icon_anchor=(0,0)
         )
     ).add_to(fg)
-    # Fix 1 — fg_fort passé explicitement, pas pris depuis le contexte global
-    # Fix 5 — comparaison explicite au lieu de bool() fragile
-    if fort is True and fg_fort_ref is not None:
-        folium.Marker(
-            [lat, lon],
-            icon=folium.DivIcon(
-                html='<div class="ping-rouge"></div>',
-                icon_size=(14, 14),
-                icon_anchor=(7, 28)
-            )
-        ).add_to(fg_fort_ref)
+    if fort is True and fg_fort_ref is not None and badge:
+        ajouter_alerte(lat, lon, fg_fort_ref, badge=badge)
 
 
 def get_gp_latlon(row):
@@ -916,7 +955,7 @@ for rang, (_, row) in enumerate(dc_parc.iterrows(), 1):
             f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a></div>"
         )
         ajouter(fg_dc,gp,lat,lon,COUL_DC,'orange','arrow-up',html,f'#{rang} Dent creuse | {adr}',sec,num,
-                fort=row.get('signal_fort_score',0)>=SIGNAL_FORT_SEUIL, fg_fort_ref=fg_fort)
+                fort=row.get('signal_fort_score',0)>=ALERTE_MIN_SEUIL, badge=row.get('signal_fort_badge',''), fg_fort_ref=fg_fort)
     except Exception as e:
         print(f'  ⚠️ DC {rang}: {e}')
 
@@ -943,8 +982,8 @@ for rang, (_, row) in enumerate(vides.iterrows(), 1):
             f"<hr style='margin:5px 0'><b>Proprio :</b> {prop} ({type_prop(prop,sir)})<br>{sir_h}"
             f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a></div>"
         )
-        ajouter(fg_vid,gp,lat,lon,COUL_VIDE,'blue','tint',html,f'#{rang} Vide | {adr}',sec,num,
-                fort=row.get('signal_fort_score',0)>=SIGNAL_FORT_SEUIL, fg_fort_ref=fg_fort)
+        ajouter(fg_vid,gp,lat,lon,COUL_VIDE,'green','tint',html,f'#{rang} Vide | {adr}',sec,num,
+                fort=row.get('signal_fort_score',0)>=ALERTE_MIN_SEUIL, badge=row.get('signal_fort_badge',''), fg_fort_ref=fg_fort)
     except Exception as e:
         print(f'  ⚠️ Vide {rang}: {e}')
 
@@ -974,14 +1013,14 @@ for rang, (_, row) in enumerate(sous.iterrows(), 1):
             f"<hr style='margin:5px 0'><b>Proprio :</b> {prop} ({type_prop(prop,sir)})<br>{sir_h}"
             f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a></div>"
         )
-        ajouter(fg_sou,gp,lat,lon,COUL_SOUS,'purple','building',html,f'#{rang} Sous-exp. | {adr}',sec,num,
-                fort=row.get('signal_fort_score',0)>=SIGNAL_FORT_SEUIL, fg_fort_ref=fg_fort)
+        ajouter(fg_sou,gp,lat,lon,COUL_SOUS,'orange','building',html,f'#{rang} Sous-exp. | {adr}',sec,num,
+                fort=row.get('signal_fort_score',0)>=ALERTE_MIN_SEUIL, badge=row.get('signal_fort_badge',''), fg_fort_ref=fg_fort)
     except Exception as e:
         print(f'  ⚠️ Sous {rang}: {e}')
 
 # 🔴 Friches
 print(f'Friches ({len(gdf_friches)})...')
-for rang, (_, row) in enumerate(gdf_friches.iterrows(), 1):
+for rang, (idx, row) in enumerate(gdf_friches.iterrows(), 1):
     try:
         nom = str(row.get(col_nom,'') or f'Friche #{rang}')
         adr = str(row.get(col_adr,'') or row.get('adresse','') or 'Adresse inconnue')
@@ -1008,81 +1047,65 @@ for rang, (_, row) in enumerate(gdf_friches.iterrows(), 1):
             f"{'<br><br><a href=' + repr(url_f) + ' target=_blank style=font-size:11px;color:#666>Fiche →</a>' if url_f else ''}"
             f"</div>"
         )
+        infos_parc = friche_parc_map.get(idx, {})
+        gp = infos_parc.get('geom_parcelle')
+        sec = str(infos_parc.get('section', '') or '').strip()
+        num = str(infos_parc.get('numero', '') or '').strip()
+        surf_parc = infos_parc.get('contenance')
+        surf_parc = int(surf_parc) if pd.notna(surf_parc) else '?'
+
+        if gp is not None:
+            geom_wgs = gpd.GeoSeries([gp], crs='EPSG:2154').to_crs('EPSG:4326').iloc[0]
+            folium.GeoJson(
+                geom_wgs.__geo_interface__,
+                style_function=lambda x: {'color': COUL_FRICHE, 'weight': 2, 'fillOpacity': 0.4}
+            ).add_to(fg_fri)
+            if sec or num:
+                folium.Marker(
+                    [lat, lon],
+                    icon=folium.DivIcon(
+                        html=(f'<div style="font-family:Arial;font-size:9px;font-weight:bold;'
+                              f'color:#1e293b;background:rgba(255,255,255,0.85);'
+                              f'padding:1px 4px;border-radius:3px;border:1px solid {COUL_FRICHE};'
+                              f'white-space:nowrap;margin-top:22px;margin-left:8px;'
+                              f'pointer-events:none">{sec} {num}</div>'),
+                        icon_size=(60,18), icon_anchor=(0,0)
+                    )
+                ).add_to(fg_fri)
+
         folium.Marker(
             [lat, lon], popup=folium.Popup(html, max_width=320),
             tooltip=f'#{rang} Friche | {nom}',
             icon=folium.Icon(color='red', icon='fire', prefix='fa')
         ).add_to(fg_fri)
+
         if geom.geom_type != 'Point':
             folium.GeoJson(
                 geom.__geo_interface__,
-                style_function=lambda x: {'color': COUL_FRICHE, 'weight': 2, 'fillOpacity': 0.3}
+                style_function=lambda x: {'color': COUL_FRICHE, 'weight': 2, 'fillOpacity': 0.15}
             ).add_to(fg_fri)
-        # Fix 2 — toutes les friches sont Signal Fort par définition
-        # (officiellement abandonnées dans la base CEREMA)
-        folium.Marker(
-            [lat, lon],
-            icon=folium.DivIcon(
-                html='<div class="ping-rouge"></div>',
-                icon_size=(14, 14),
-                icon_anchor=(7, 28)
+
+        if row.get('signal_fort_score', 0) >= ALERTE_MIN_SEUIL:
+            badge = row.get('signal_fort_badge', '!')
+            signaux = []
+            if row.get('cle', '') and row.get('cle', '') not in cles_avec_mutation:
+                signaux.append(f'✓ Aucune vente DVF depuis {ANNEE_DVF_DEBUT}')
+            if row.get('cle', '') in cles_demembrement:
+                signaux.append('✓ Démembrement (succession)')
+            alerte_html = (
+                f"<div style='font-family:Arial;font-size:13px;min-width:280px;line-height:1.9'>"
+                f"<b style='font-size:15px;color:#EC4899'>{badge} Alerte complémentaire</b><br>"
+                f"<b style='color:{COUL_FRICHE}'>Friche répertoriée</b><br>"
+                f"<a href='{gm}' target='_blank' style='color:#1a6fb5;font-weight:bold;text-decoration:none'>📍 {adr}</a><br><br>"
+                f"{f'<b>Parcelle :</b> {sec} n°{num} | <b>Surface parcelle :</b> {surf_parc} m²<br>' if sec or num else ''}"
+                f"<b>Site :</b> {nom}<br>"
+                f"<b>Type :</b> {typ} | <b>Statut :</b> {stat}<br>"
+                f"<hr style='margin:5px 0'>{'<br>'.join(signaux) if signaux else 'Alerte complémentaire'}"
+                f"</div>"
             )
-        ).add_to(fg_fort)
+            ajouter_alerte(lat, lon, fg_fort, badge=badge, html=alerte_html, tooltip=f'{badge} Alerte | Friche | {nom}')
     except Exception as e:
         print(f'  ⚠️ Friche {rang}: {e}')
-
-# 🚨 Vacants Signal Fort — affichés directement dans fg_fort
-vac_fort = parc_vacants[parc_vacants['signal_fort_score'] >= SIGNAL_FORT_SEUIL].copy()
-print(f'Vacants Signal Fort ({len(vac_fort)})...')
-for rang, (_, row) in enumerate(vac_fort.iterrows(), 1):
-    try:
-        sec   = str(row.get('section','')).strip()
-        num   = str(row.get('numero','')).strip()
-        surf  = int(row['contenance']) if pd.notna(row.get('contenance')) else '?'
-        adr   = str(row.get('adresse','') or 'Adresse inconnue')
-        prop  = str(row.get('denomination','Particulier'))
-        sir   = str(row.get('siren','') or '')
-        emp   = round(float(row.get('emprise_ratio',0) or 0)*100, 1)
-        score = int(row.get('signal_fort_score', 0))
-        cle   = row.get('cle','')
-        gp, lat, lon = get_gp_latlon(row)
-        ae = urllib.parse.quote(adr)
-        gm = f'https://www.google.com/maps/search/?api=1&query={ae}'
-        ge = f'https://earth.google.com/web/search/{ae}'
-        sir_h = f"<b>SIREN :</b> {sir}<br>" if sir and sir not in ('','nan') else ''
-
-        signaux = []
-        if cle in cles_demembrement: signaux.append('✓ Démembrement (succession)')
-        if cle in cles_friches:      signaux.append('✓ Friche répertoriée')
-        if sir and sir not in ('','nan'): signaux.append('✓ Société identifiée')
-        signaux.append(f'✓ Aucune vente DVF depuis {ANNEE_DVF_DEBUT}')
-        # Indivision — info seulement, pas dans le score
-        if cle in cles_multi_sans_synd:
-            signaux.append('ℹ️ Plusieurs entités sur la parcelle (sans syndic)')
-
-        html = (
-            f"<div style='font-family:Arial;font-size:13px;min-width:280px;line-height:1.9'>"
-            f"<b style='font-size:15px;color:#DC2626'>🚨 Signal Fort ({score} signaux)</b><br>"
-            f"<a href='{gm}' target='_blank' style='color:#1a6fb5;font-weight:bold;text-decoration:none'>📍 {adr}</a><br><br>"
-            f"<b>Parcelle :</b> {sec} n°{num} | <b>Surface :</b> {surf} m²<br>"
-            f"<b>Emprise bâtie :</b> {emp}%"
-            f"<hr style='margin:5px 0'><b>Proprio :</b> {prop} ({type_prop(prop,sir)})<br>{sir_h}"
-            f"<hr style='margin:5px 0'>{'<br>'.join(signaux)}"
-            f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a></div>"
-        )
-        geom_wgs = gpd.GeoSeries([gp], crs='EPSG:2154').to_crs('EPSG:4326').iloc[0]
-        folium.GeoJson(
-            geom_wgs.__geo_interface__,
-            style_function=lambda x: {'color':'#DC2626','weight':2,'fillOpacity':0.4}
-        ).add_to(fg_fort)
-        folium.Marker(
-            [lat, lon],
-            popup=folium.Popup(html, max_width=330),
-            tooltip=f'🚨 Signal Fort | {adr} | {score} signaux',
-            icon=folium.Icon(color='red', icon='exclamation', prefix='fa')
-        ).add_to(fg_fort)
-    except Exception as e:
-        print(f'  ⚠️ Vacant fort {rang}: {e}')
 
 for fg in [fg_dc, fg_vid, fg_sou, fg_fri, fg_fort]:
     fg.add_to(carte)
@@ -1100,13 +1123,13 @@ carte.get_root().html.add_child(folium.Element(
     f"<span style='color:{COUL_SOUS}'>&#9679;</span> Sous-exploités filtrés {len(sous)}<br>"
     f"<span style='color:{COUL_FRICHE}'>&#9679;</span> Friches {len(gdf_friches)}<br>"
     f"<hr style='margin:6px 0'>"
-    f"<span style='color:#DC2626'>&#9679;</span> <b>Signal Fort</b> {nb_fort}"
+    f"<span style='color:#EC4899'>&#9679;</span> <b>Alertes complémentaires</b> {nb_fort}"
     f"<i style='color:#999;font-size:10px;display:block;margin-top:3px'>"
-    f"≥{SIGNAL_FORT_SEUIL} signaux — ping rouge + marqueurs dédiés</i>"
+    f"1 point = ! | 2 points = !!</i>"
     f"</div>"
 ))
 
-print(f'✅ Carte affichée — {total} opportunités + {nb_fort} Signal Fort')
+print(f'✅ Carte affichée — {total} opportunités + {nb_fort} alertes complémentaires')
 os.makedirs(os.path.dirname(OUTPUT_HTML), exist_ok=True)
 carte.save(OUTPUT_HTML)
 print(f'✅ HTML généré : {OUTPUT_HTML}')
@@ -1132,7 +1155,6 @@ try:
         (vides,      'Terrain vide'),
         (sous,       'Sous-exploité'),
         (gdf_friches,'Friche'),
-        (vac_fort,   'Signal Fort vacant'),
     ]:
         e = _prep_export(_df, _cat)
         if e is not None:
