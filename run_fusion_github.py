@@ -27,6 +27,9 @@ OUTPUT_GEOJSON = os.environ.get('OUTPUT_GEOJSON', 'docs/opportunites.geojson')
 CODE_INSEE    = os.environ.get('CODE_INSEE', '93048')
 CHEMIN_MAJIC  = os.environ.get('CHEMIN_MAJIC', 'data/majic.parquet')
 CHEMIN_LOCAUX = os.environ.get('CHEMIN_LOCAUX', 'data/locaux.parquet')
+ENABLE_GEOCODING = str(os.environ.get('ENABLE_GEOCODING', '1')).strip().lower() not in ('0', 'false', 'no', 'off')
+ENABLE_GEOJSON   = str(os.environ.get('ENABLE_GEOJSON', '1')).strip().lower() not in ('0', 'false', 'no', 'off')
+MAX_PARCELLES_SECURITE = int(os.environ.get('MAX_PARCELLES_SECURITE', '50000'))
 
 # Blocage 6 — Normalisation code INSEE
 # Certains fichiers parquet stockent '93048', d'autres '093048'
@@ -98,6 +101,7 @@ DOM_PUBLIC = [
 ]
 
 print(f'Commune : {CODE_INSEE} | Département : {DEPT} | Surface max : {SURFACE_MAX_M2} m²')
+print(f'Options : geocodage={ENABLE_GEOCODING} | geojson={ENABLE_GEOJSON} | max_parcelles_securite={MAX_PARCELLES_SECURITE}')
 
 
 def resume_annees(annees):
@@ -229,54 +233,60 @@ print(f'✅ BD TOPO : {len(bat_dc)} bâtiments avec hauteur | {round(time.time()
 # Parcelles cadastrales
 # Parcelles cadastrales — avec pagination (l'API plafonne à 1000 par requête)
 def charger_parcelles(code, essais=5, delai=15):
-    toutes = []
-    offset = 0
-    limit  = 1000
-    while True:
-        url = (
-            f'https://apicarto.ign.fr/api/cadastre/parcelle'
-            f'?code_insee={code}&_limit={limit}&_offset={offset}'
-        )
-        succes = False
-        for i in range(1, essais + 1):
-            try:
-                print(f'  Essai {i}/{essais} (offset={offset})...')
-                r = requests.get(url, timeout=60)
-                r.raise_for_status()
-                features = r.json().get('features', [])
-                toutes.extend(features)
-                print(f'  +{len(features)} parcelles (total : {len(toutes)})')
-                succes = True
-                break
-            except Exception as e:
-                print(f'  ❌ {str(e)[:80]}')
-                if i < essais:
-                    print(f'  Retry dans {delai}s...')
-                    time.sleep(delai)
+    # Mode simple et fiable : une seule requête par commune.
+    # La pagination IGN avec _limit/_offset a déjà renvoyé un volume incohérent
+    # sur GitHub (jusqu'à des centaines de milliers de parcelles).
+    url = f'https://apicarto.ign.fr/api/cadastre/parcelle?code_insee={code}'
+    for i in range(1, essais + 1):
+        try:
+            print(f'  Essai {i}/{essais}...')
+            r = requests.get(url, timeout=90)
+            r.raise_for_status()
+            features = r.json().get('features', [])
+            if len(features) == 0:
+                raise ValueError('0 parcelles retournées')
 
-        if not succes:
-            # On ne plante pas — on travaille avec ce qu'on a
-            print(f'  ⚠️ Pagination interrompue à offset={offset} — on continue avec {len(toutes)} parcelles')
-            break
+            gdf = gpd.GeoDataFrame.from_features(features, crs='EPSG:4326')
+            keep = [c for c in ['geometry', 'section', 'numero', 'contenance'] if c in gdf.columns]
+            gdf = gdf[keep].copy()
+            if 'section' not in gdf.columns:
+                gdf['section'] = ''
+            if 'numero' not in gdf.columns:
+                gdf['numero'] = ''
+            if 'contenance' not in gdf.columns:
+                gdf['contenance'] = np.nan
 
-        if len(features) < limit:
-            break   # Dernière page atteinte
-        offset += limit
-        time.sleep(1)  # Respecter le rate limit IGN entre pages
+            if len(gdf) > MAX_PARCELLES_SECURITE:
+                raise RuntimeError(
+                    f'Volume incohérent : {len(gdf)} parcelles pour la commune {code} '
+                    f'(seuil sécurité {MAX_PARCELLES_SECURITE}).'
+                )
 
-    if len(toutes) == 0:
-        print(f'  ⚠️ Aucune parcelle récupérée pour {code} — carte vide possible')
-        return gpd.GeoDataFrame(columns=['geometry','section','numero','contenance'], crs='EPSG:4326')
+            print(f'  ✅ {len(gdf)} parcelles brutes')
+            return gdf
+        except Exception as e:
+            print(f'  ❌ {str(e)[:140]}')
+            if i < essais:
+                print(f'  Retry dans {delai}s...')
+                time.sleep(delai)
 
-    gdf = gpd.GeoDataFrame.from_features(toutes, crs='EPSG:4326')
-    print(f'  ✅ {len(gdf)} parcelles au total')
-    return gdf
+    raise Exception(f'Cadastre inaccessible ou incohérent pour {code}')
 
 
 print(f'Parcelles {CODE_INSEE}...')
 parcelles = charger_parcelles(CODE_INSEE)
 parcelles = parcelles.to_crs(epsg=2154)
-parcelles['geometry']   = parcelles.geometry.buffer(0)
+parcelles['geometry'] = parcelles.geometry.buffer(0)
+parcelles = parcelles[parcelles.geometry.notna()].copy()
+parcelles = parcelles[~parcelles.geometry.is_empty].copy()
+avant_clip_commune = len(parcelles)
+parcelles = gpd.clip(parcelles, commune_gdf).copy()
+print(f'  Clip commune : {avant_clip_commune} → {len(parcelles)} parcelles')
+if len(parcelles) > MAX_PARCELLES_SECURITE:
+    raise Exception(
+        f'Sécurité parcelles : {len(parcelles)} parcelles après clip pour {CODE_INSEE} '
+        f'(max autorisé {MAX_PARCELLES_SECURITE}).'
+    )
 parcelles['contenance'] = pd.to_numeric(parcelles['contenance'], errors='coerce')
 parcelles['parc_area']  = parcelles.geometry.area
 parcelles['cle']        = (
@@ -311,8 +321,8 @@ try:
     c_num = next((c for c in cols_m if 'numero' in c.lower() and 'section' not in c.lower()), None)
     c_den = next((c for c in cols_m if 'denomination' in c.lower()), None)
     c_sir = next((c for c in cols_m if 'siren' in c.lower()), None)
-    c_dep = next((c for c in cols_m if c.lower() in ('ccodep','dep','code_dep')), None)
-    c_com = next((c for c in cols_m if c.lower() in ('ccocom','com','code_com')), None)
+    c_dep = next((c for c in cols_m if c.lower() in ('ccodep','dep','code_dep','departement')), None)
+    c_com = next((c for c in cols_m if c.lower() in ('ccocom','com','code_com','code_commune')), None)
     print(f'  Colonnes : sec={c_sec} num={c_num} dep={c_dep} com={c_com}')
 
     commune_3 = CODE_INSEE[2:]
@@ -926,14 +936,21 @@ def geocoder_df(df):
     return df
 
 
-print('Géocodage...')
-dc_parc   = geocoder_df(dc_parc)
-vides     = geocoder_df(vides)
-sous      = geocoder_df(sous)
-vac_fort  = geocoder_df(vac_fort)
-if len(gdf_friches) > 0:
-    gdf_friches = geocoder_df(gdf_friches)
-print('✅ Adresses récupérées')
+if ENABLE_GEOCODING:
+    print('Géocodage...')
+    dc_parc   = geocoder_df(dc_parc)
+    vides     = geocoder_df(vides)
+    sous      = geocoder_df(sous)
+    vac_fort  = geocoder_df(vac_fort)
+    if len(gdf_friches) > 0:
+        gdf_friches = geocoder_df(gdf_friches)
+    print('✅ Adresses récupérées')
+else:
+    print('ℹ️ Géocodage désactivé')
+    for _df in [dc_parc, vides, sous, vac_fort]:
+        _df['adresse'] = 'Adresse non géocodée'
+    if len(gdf_friches) > 0:
+        gdf_friches['adresse'] = 'Adresse non géocodée'
 
 # Associer chaque friche à sa parcelle cadastrale
 friche_parc_map = {}
@@ -1368,38 +1385,41 @@ os.makedirs(os.path.dirname(OUTPUT_HTML), exist_ok=True)
 carte.save(OUTPUT_HTML)
 print(f'✅ HTML généré : {OUTPUT_HTML}')
 
-try:
-    exports = []
+if ENABLE_GEOJSON:
+    try:
+        exports = []
 
-    def _prep_export(df, categorie):
-        if len(df) == 0:
-            return None
-        df = df.copy()
-        if 'geom_parcelle' in df.columns:
-            df['geometry'] = df['geom_parcelle']
-        if getattr(df, 'crs', None) is None:
-            df = gpd.GeoDataFrame(df, geometry='geometry', crs='EPSG:2154')
-        if df.crs.to_epsg() != 4326:
-            df = df.to_crs(epsg=4326)
-        df['categorie_export'] = categorie
-        return df
+        def _prep_export(df, categorie):
+            if len(df) == 0:
+                return None
+            df = df.copy()
+            if 'geom_parcelle' in df.columns:
+                df['geometry'] = df['geom_parcelle']
+            if getattr(df, 'crs', None) is None:
+                df = gpd.GeoDataFrame(df, geometry='geometry', crs='EPSG:2154')
+            if df.crs.to_epsg() != 4326:
+                df = df.to_crs(epsg=4326)
+            df['categorie_export'] = categorie
+            return df
 
-    for _df, _cat in [
-        (dc_parc,    'Dent creuse'),
-        (vides,      'Terrain vide'),
-        (sous,       'Sous-exploité'),
-        (gdf_friches,'Friche'),
-        (vac_fort,   'Signal Fort vacant'),
-    ]:
-        e = _prep_export(_df, _cat)
-        if e is not None:
-            exports.append(e)
+        for _df, _cat in [
+            (dc_parc,    'Dent creuse'),
+            (vides,      'Terrain vide'),
+            (sous,       'Sous-exploité'),
+            (gdf_friches,'Friche'),
+            (vac_fort,   'Signal Fort vacant'),
+        ]:
+            e = _prep_export(_df, _cat)
+            if e is not None:
+                exports.append(e)
 
-    if exports:
-        all_gdf = pd.concat(exports, ignore_index=True)
-        all_gdf = gpd.GeoDataFrame(all_gdf, geometry='geometry', crs='EPSG:4326')
-        os.makedirs(os.path.dirname(OUTPUT_GEOJSON), exist_ok=True)
-        all_gdf.to_file(OUTPUT_GEOJSON, driver='GeoJSON')
-        print(f'✅ GeoJSON exporté : {OUTPUT_GEOJSON}')
-except Exception as e:
-    print(f'⚠️ Export GeoJSON ignoré : {e}')
+        if exports:
+            all_gdf = pd.concat(exports, ignore_index=True)
+            all_gdf = gpd.GeoDataFrame(all_gdf, geometry='geometry', crs='EPSG:4326')
+            os.makedirs(os.path.dirname(OUTPUT_GEOJSON), exist_ok=True)
+            all_gdf.to_file(OUTPUT_GEOJSON, driver='GeoJSON')
+            print(f'✅ GeoJSON exporté : {OUTPUT_GEOJSON}')
+    except Exception as e:
+        print(f'⚠️ Export GeoJSON ignoré : {e}')
+else:
+    print('ℹ️ Export GeoJSON désactivé')
