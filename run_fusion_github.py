@@ -230,47 +230,62 @@ gc.collect()
 print(f'✅ BD TOPO : {len(bat_dc)} bâtiments avec hauteur | {round(time.time()-t0)}s')
 
 
-# Parcelles cadastrales
-# Parcelles cadastrales — avec pagination (l'API plafonne à 1000 par requête)
-def charger_parcelles(code, essais=5, delai=15):
-    # Mode simple et fiable : une seule requête par commune.
-    # La pagination IGN avec _limit/_offset a déjà renvoyé un volume incohérent
-    # sur GitHub (jusqu'à des centaines de milliers de parcelles).
-    url = f'https://apicarto.ign.fr/api/cadastre/parcelle?code_insee={code}'
-    for i in range(1, essais + 1):
-        try:
-            print(f'  Essai {i}/{essais}...')
-            r = requests.get(url, timeout=90)
-            r.raise_for_status()
-            features = r.json().get('features', [])
-            if len(features) == 0:
-                raise ValueError('0 parcelles retournées')
+# Parcelles cadastrales — via fichier département complet (cache disque)
+# L'API IGN par commune est limitée à 1000 parcelles — inutilisable.
+# On télécharge le fichier département une seule fois pour les 9 communes.
+def charger_parcelles(code):
+    dept          = code[:2]
+    cache         = f'/tmp/parcelles_{dept}.geojson'
+    url_dept      = (f'https://cadastre.data.gouv.fr/bundler/cadastre-etalab'
+                     f'/departements/{dept}/geojson/parcelles')
 
-            gdf = gpd.GeoDataFrame.from_features(features, crs='EPSG:4326')
-            keep = [c for c in ['geometry', 'section', 'numero', 'contenance'] if c in gdf.columns]
-            gdf = gdf[keep].copy()
-            if 'section' not in gdf.columns:
-                gdf['section'] = ''
-            if 'numero' not in gdf.columns:
-                gdf['numero'] = ''
-            if 'contenance' not in gdf.columns:
-                gdf['contenance'] = np.nan
+    # Téléchargement avec cache
+    if os.path.exists(cache):
+        print(f'  Cache trouvé — lecture {cache}')
+    else:
+        print(f'  Téléchargement fichier département {dept}...')
+        r = requests.get(url_dept, timeout=300)
+        r.raise_for_status()
+        with open(cache, 'wb') as f:
+            f.write(r.content)
+        print(f'  ✅ {os.path.getsize(cache)/1e6:.0f} Mo en cache')
 
-            if len(gdf) > MAX_PARCELLES_SECURITE:
-                raise RuntimeError(
-                    f'Volume incohérent : {len(gdf)} parcelles pour la commune {code} '
-                    f'(seuil sécurité {MAX_PARCELLES_SECURITE}).'
-                )
+    dept_gdf = gpd.read_file(cache)
 
-            print(f'  ✅ {len(gdf)} parcelles brutes')
-            return gdf
-        except Exception as e:
-            print(f'  ❌ {str(e)[:140]}')
-            if i < essais:
-                print(f'  Retry dans {delai}s...')
-                time.sleep(delai)
+    # Trouver la colonne code INSEE
+    col_com = next(
+        (c for c in dept_gdf.columns
+         if c.lower() in ('commune','code_insee','codecom','code_com','insee')),
+        None
+    )
+    if col_com is None:
+        raise Exception(f'Colonne commune introuvable : {list(dept_gdf.columns)}')
 
-    raise Exception(f'Cadastre inaccessible ou incohérent pour {code}')
+    # Filtrer sur la commune
+    gdf = dept_gdf[dept_gdf[col_com].astype(str) == code].copy()
+    del dept_gdf
+
+    if len(gdf) == 0:
+        print(f'  ⚠️ 0 parcelles pour {code} — commune absente du fichier département')
+        return gpd.GeoDataFrame(
+            columns=['geometry','section','numero','contenance'], crs='EPSG:4326'
+        )
+
+    # Standardiser les colonnes
+    col_sec = next((c for c in gdf.columns if 'section' in c.lower()), None)
+    col_num = next((c for c in gdf.columns if c.lower() in ('numero','numero_abs','num')), None)
+    col_cnt = next((c for c in gdf.columns if 'contenance' in c.lower()), None)
+
+    if col_sec: gdf = gdf.rename(columns={col_sec: 'section'})
+    if col_num: gdf = gdf.rename(columns={col_num: 'numero'})
+    if col_cnt: gdf = gdf.rename(columns={col_cnt: 'contenance'})
+
+    if 'section'    not in gdf.columns: gdf['section']    = ''
+    if 'numero'     not in gdf.columns: gdf['numero']     = ''
+    if 'contenance' not in gdf.columns: gdf['contenance'] = np.nan
+
+    print(f'  ✅ {len(gdf)} parcelles brutes pour {code}')
+    return gdf[['geometry','section','numero','contenance']].copy()
 
 
 print(f'Parcelles {CODE_INSEE}...')
@@ -282,11 +297,6 @@ parcelles = parcelles[~parcelles.geometry.is_empty].copy()
 avant_clip_commune = len(parcelles)
 parcelles = gpd.clip(parcelles, commune_gdf).copy()
 print(f'  Clip commune : {avant_clip_commune} → {len(parcelles)} parcelles')
-if len(parcelles) > MAX_PARCELLES_SECURITE:
-    raise Exception(
-        f'Sécurité parcelles : {len(parcelles)} parcelles après clip pour {CODE_INSEE} '
-        f'(max autorisé {MAX_PARCELLES_SECURITE}).'
-    )
 parcelles['contenance'] = pd.to_numeric(parcelles['contenance'], errors='coerce')
 parcelles['parc_area']  = parcelles.geometry.area
 parcelles['cle']        = (
