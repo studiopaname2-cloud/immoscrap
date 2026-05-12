@@ -13,7 +13,9 @@ import pyarrow.parquet as pq
 import requests
 from shapely import wkt as shapely_wkt
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', message='.*pandas.Int64Index.*')
+warnings.filterwarnings('ignore', message='.*initial implementation of Parquet.*')
 
 OUTPUT_HTML = os.environ.get('OUTPUT_HTML', 'docs/index.html')
 OUTPUT_GEOJSON = os.environ.get('OUTPUT_GEOJSON', 'docs/opportunites.geojson')
@@ -22,8 +24,12 @@ OUTPUT_GEOJSON = os.environ.get('OUTPUT_GEOJSON', 'docs/opportunites.geojson')
 # ║  UNE SEULE LIGNE À MODIFIER                 ║
 # ╚══════════════════════════════════════════════╝
 
-CODE_INSEE = os.environ.get('CODE_INSEE', '93048')
-CHEMIN_MAJIC = os.environ.get('CHEMIN_MAJIC', 'data/majic.parquet')
+CODE_INSEE    = os.environ.get('CODE_INSEE', '93048')
+CHEMIN_MAJIC  = os.environ.get('CHEMIN_MAJIC', 'data/majic.parquet')
+CHEMIN_LOCAUX = os.environ.get('CHEMIN_LOCAUX', 'data/locaux.parquet')
+
+# Signal Fort — score minimum pour afficher le ping rouge
+SIGNAL_FORT_SEUIL = 2   # 2 signaux cumulés = ping rouge
 
 # Dents creuses
 HAUT_MAX_DC         = 7.0
@@ -240,9 +246,8 @@ print(f'✅ {len(parcelles)} parcelles utilisables')
 
 # MAJIC — chargement optimisé (filtre par commune)
 print('Chargement MAJIC...')
-MAJIC_OK   = False
-majic_pp   = pd.DataFrame(columns=['cle','denomination','siren'])
-cles_copro = set()
+MAJIC_OK = False
+majic_pp = pd.DataFrame(columns=['cle','denomination','siren'])
 
 try:
     schema    = pq.read_schema(CHEMIN_MAJIC)
@@ -267,27 +272,23 @@ try:
         print(f'  ⚠️ Chargement complet : {len(m)} lignes')
 
     if c_sec and c_num:
-        m['cle']   = (
+        m['cle'] = (
             m[c_sec].astype(str).str.strip() + '_' +
             m[c_num].astype(str).str.strip().str.zfill(4)
         )
-        nb_prop    = m.groupby('cle').size().reset_index(name='nb_prop')
-        cles_copro = set(nb_prop[nb_prop['nb_prop'] > 1]['cle'])
-        cles_pp    = set(nb_prop[nb_prop['nb_prop'] == 1]['cle'])
-        cols_keep  = ['cle'] + [c for c in [c_den, c_sir] if c]
-        majic_pp   = m[m['cle'].isin(cles_pp)][cols_keep].copy()
+        # On charge toutes les parcelles MAJIC connues
+        # Le filtre copropriété (cles_syndic) vient du fichier locaux
+        cles_pp   = set(m['cle'].unique())
+        cols_keep = ['cle'] + [c for c in [c_den, c_sir] if c]
+        majic_pp  = m[cols_keep].drop_duplicates('cle').copy()
         rename_map = {}
-        if c_den:
-            rename_map[c_den] = 'denomination'
-        if c_sir:
-            rename_map[c_sir] = 'siren'
+        if c_den: rename_map[c_den] = 'denomination'
+        if c_sir: rename_map[c_sir] = 'siren'
         majic_pp = majic_pp.rename(columns=rename_map)
-        if 'denomination' not in majic_pp.columns:
-            majic_pp['denomination'] = ''
-        if 'siren' not in majic_pp.columns:
-            majic_pp['siren'] = ''
+        if 'denomination' not in majic_pp.columns: majic_pp['denomination'] = ''
+        if 'siren'        not in majic_pp.columns: majic_pp['siren']        = ''
         MAJIC_OK = True
-        print(f'✅ MAJIC — {len(cles_pp)} PP | {len(cles_copro)} copropriétés')
+        print(f'✅ MAJIC — {len(cles_pp)} parcelles personnes morales')
     else:
         print('⚠️ Colonnes section/numero introuvables')
 
@@ -295,6 +296,49 @@ try:
     gc.collect()
 except Exception as e:
     print(f'⚠️ MAJIC non chargé : {e}')
+
+# ══════════════════════════════════════════════════════
+# LOCAUX — Démembrement (nu-proprio + usufruitier)
+# Quand une parcelle a les deux droits simultanément
+# c'est souvent une succession bloquée.
+# ══════════════════════════════════════════════════════
+print('Locaux — démembrement + copropriétés réelles...')
+cles_demembrement    = set()
+cles_syndic          = set()
+cles_multi_sans_synd = set()   # plusieurs entités sur la même parcelle, sans syndic
+
+try:
+    fichier_lx = pq.ParquetFile(CHEMIN_LOCAUX)
+    lx = fichier_lx.read(
+        columns=['code_insee', 'section', 'numero_parcelle', 'code_droit_libelle']
+    ).to_pandas()
+    lx = lx[lx['code_insee'].astype(str) == CODE_INSEE].copy()
+    lx['cle'] = (
+        lx['section'].astype(str).str.strip() + '_' +
+        lx['numero_parcelle'].astype(str).str.strip().str.zfill(4)
+    )
+
+    # Démembrement : nu-proprio + usufruitier sur la même parcelle
+    cles_nuprop       = set(lx[lx['code_droit_libelle'] == 'Nu-propriétaire']['cle'])
+    cles_usuf         = set(lx[lx['code_droit_libelle'] == 'Usufruitier']['cle'])
+    cles_demembrement = cles_nuprop & cles_usuf
+
+    # Vraie copropriété : syndic identifié dans le fichier locaux
+    cles_syndic = set(lx[lx['code_droit_libelle'] == 'Syndic de copropriété']['cle'])
+
+    # Multi-entités sans syndic : plusieurs personnes morales sur la même parcelle
+    # sans syndic identifié — pas nécessairement une indivision au sens juridique
+    nb_prop_lx           = lx.groupby('cle').size().reset_index(name='nb_prop')
+    cles_multi           = set(nb_prop_lx[nb_prop_lx['nb_prop'] > 1]['cle'])
+    cles_multi_sans_synd = cles_multi - cles_syndic
+
+    print(f'✅ Locaux — {len(cles_demembrement)} démembrements | '
+          f'{len(cles_syndic)} syndics | '
+          f'{len(cles_multi_sans_synd)} multi-entités sans syndic')
+    del lx
+    gc.collect()
+except Exception as e:
+    print(f'⚠️ Locaux non chargé : {e}')
 
 
 # =========================================================
@@ -507,7 +551,7 @@ if MAJIC_OK:
     )
     parc_pp['denomination'] = parc_pp['denomination'].fillna('Particulier')
     parc_pp['siren']        = parc_pp['siren'].fillna('')
-    parc_pp = parc_pp[~parc_pp['cle'].isin(cles_copro)].copy()
+    parc_pp = parc_pp[~parc_pp['cle'].isin(cles_syndic)].copy()
     masque = parc_pp['denomination'].str.upper().apply(
         lambda x: any(d in x for d in DOM_PUBLIC)
     )
@@ -583,10 +627,12 @@ dc_parc = dc_parc.merge(parc_geom, on='cle', how='left')
 vides   = vides.merge(parc_geom, on='cle', how='left')
 sous    = sous.merge(parc_geom, on='cle', how='left')
 
-# ── Catégorie 4 : Biens vacants ─────────────────
+# ── Candidats Signal Fort vacants ───────────────
+# On calcule les candidats vacants pour le Signal Fort
+# mais on ne les affiche PAS comme calque séparé
 candidats = parcelles.copy()
-if MAJIC_OK:
-    candidats = candidats[~candidats['cle'].isin(cles_copro)].copy()
+# Exclure uniquement les vraies copropriétés (syndic identifié)
+candidats = candidats[~candidats['cle'].isin(cles_syndic)].copy()
 if cles_avec_mutation:
     candidats = candidats[~candidats['cle'].isin(cles_avec_mutation)].copy()
 candidats = candidats[
@@ -602,23 +648,84 @@ candidats['siren']        = candidats['siren'].fillna('')
 masque_pub = candidats['denomination'].str.upper().apply(
     lambda x: any(d in x for d in DOM_PUBLIC)
 )
-candidats = candidats[~masque_pub].copy()
+candidats    = candidats[~masque_pub].copy()
 parc_vacants = candidats.merge(parc_geom, on='cle', how='left').copy()
 parc_vacants['categorie'] = 'Bien vacant'
-print(f'  🟤 {len(parc_vacants)} biens vacants')
+print(f'  🟤 {len(parc_vacants)} candidats vacants (Signal Fort uniquement)')
 
-print(f'\n✅ Total : {len(dc_parc)+len(vides)+len(sous)+len(gdf_friches)+len(parc_vacants)} opportunités')
+# Total = uniquement les catégories affichées sur la carte
+# parc_vacants n'est PAS affiché — seuls les vacants Signal Fort le seront
+total_affiche = len(dc_parc) + len(vides) + len(sous) + len(gdf_friches)
+print(f'\n✅ Total affiché : {total_affiche} opportunités (hors vacants Signal Fort)')
 
+# ══════════════════════════════════════════════════════
+# SIGNAL FORT — score par cumul de signaux
+#
+# +1  Aucune vente DVF depuis 2014
+# +1  Démembrement (nu-proprio + usufruitier)
+# +1  Répertorié dans Cartofriches
+# +1  Pleine propriété société (SIREN connu)
+#
+# Seuil : SIGNAL_FORT_SEUIL signaux → ping rouge
+# ══════════════════════════════════════════════════════
+print('Calcul Signal Fort...')
 
-def get_adresse(lat, lon):
+# Fix 3 — Récupérer la clé cadastrale des friches via jointure spatiale
+# Cartofriches ne contient pas de clé parcelle — on la retrouve
+# en cherchant quelle parcelle contient le point GPS de chaque friche
+cles_friches = set()
+if len(gdf_friches) > 0:
     try:
-        r = requests.get(
-            f'https://api-adresse.data.gouv.fr/reverse/?lon={lon}&lat={lat}',
-            timeout=5)
-        feats = r.json().get('features', [])
-        return feats[0]['properties'].get('label', '') if feats else ''
-    except Exception:
-        return ''
+        friches_2154 = gdf_friches.to_crs(epsg=2154).copy()
+        friches_2154['geometry'] = friches_2154.geometry.centroid
+        joined_f = gpd.sjoin(
+            friches_2154[['geometry']],
+            parcelles[['geometry','cle']],
+            how='inner', predicate='within'
+        )
+        cles_friches = set(joined_f['cle'].dropna())
+        print(f'  {len(cles_friches)} parcelles identifiées comme friches')
+    except Exception as e:
+        print(f'  ⚠️ Jointure friches/parcelles : {e}')
+
+# Fix 4 — Score différencié selon la catégorie
+# Les vacants sont déjà filtrés par DVF=0 → ce signal ne les discrimine pas
+# On ne le compte donc que pour les autres catégories
+def score_signal_fort(cle, siren='', compter_dvf=True):
+    score = 0
+    if compter_dvf and cle not in cles_avec_mutation:
+        score += 1
+    if cle in cles_demembrement:
+        score += 1  # Succession potentiellement bloquée
+    if cle in cles_friches:
+        score += 1  # Répertoriée comme friche
+    if siren and str(siren) not in ('', 'nan'):
+        score += 1  # Propriétaire société identifiée
+    # Note : cles_multi_sans_synd affiché dans le popup mais pas compté dans le score
+    return score
+
+def ajouter_score(df, compter_dvf=True):
+    df = df.copy()
+    df['signal_fort_score'] = df.apply(
+        lambda r: score_signal_fort(
+            r.get('cle', ''), r.get('siren', ''), compter_dvf
+        ), axis=1
+    )
+    df['signal_fort'] = df['signal_fort_score'] >= SIGNAL_FORT_SEUIL
+    return df
+
+dc_parc      = ajouter_score(dc_parc,      compter_dvf=True)
+vides        = ajouter_score(vides,         compter_dvf=True)
+sous         = ajouter_score(sous,          compter_dvf=True)
+parc_vacants = ajouter_score(parc_vacants,  compter_dvf=False)  # déjà filtré
+
+nb_fort = int(sum([
+    dc_parc['signal_fort'].sum(),
+    vides['signal_fort'].sum(),
+    sous['signal_fort'].sum(),
+    parc_vacants['signal_fort'].sum()
+]))
+print(f'✅ {nb_fort} biens avec Signal Fort (≥{SIGNAL_FORT_SEUIL} signaux)')
 
 
 def geocoder_df(df):
@@ -626,16 +733,42 @@ def geocoder_df(df):
         df = df.copy()
         df['adresse'] = []
         return df
+
     pts = df.copy()
     if pts.crs and pts.crs.to_epsg() != 4326:
         pts = pts.to_crs(epsg=4326)
-    pts['geometry'] = pts.geometry.centroid
-    adrs = []
-    for _, row in pts.iterrows():
-        adrs.append(get_adresse(round(row.geometry.y, 6), round(row.geometry.x, 6)))
-        time.sleep(0.1)
+    centroids = pts.geometry.centroid
+
+    # Batch — on envoie toutes les coordonnées en une seule requête CSV
+    # au lieu d'un appel par ligne → 10-20x plus rapide
+    lignes = ['longitude,latitude,idx']
+    for i, geom in enumerate(centroids):
+        lignes.append(f'{round(geom.x,6)},{round(geom.y,6)},{i}')
+    csv_data = '\n'.join(lignes)
+
+    try:
+        r = requests.post(
+            'https://api-adresse.data.gouv.fr/reverse/csv/',
+            files={'data': ('coords.csv', csv_data.encode(), 'text/csv')},
+            timeout=120
+        )
+        r.raise_for_status()
+        result = pd.read_csv(io.StringIO(r.text))
+        col_label = next(
+            (c for c in result.columns if 'result_label' in c.lower() or c.lower() == 'label'),
+            None
+        )
+        if col_label and 'idx' in result.columns:
+            result = result.sort_values('idx')
+            adresses = result[col_label].fillna('Adresse inconnue').tolist()
+        else:
+            adresses = ['Adresse inconnue'] * len(df)
+    except Exception as e:
+        print(f'  ⚠️ Géocodage batch échoué : {e} — adresses inconnues')
+        adresses = ['Adresse inconnue'] * len(df)
+
     df = df.copy()
-    df['adresse'] = adrs
+    df['adresse'] = adresses
     return df
 
 
@@ -676,14 +809,37 @@ folium.TileLayer(
     attr='© IGN', name='Parcelles IGN', overlay=True, control=True, opacity=0.55
 ).add_to(carte)
 
+# CSS animation ping rouge — injecté une seule fois dans la page
+carte.get_root().html.add_child(folium.Element("""
+<style>
+@keyframes ping {
+  0%   { transform: scale(1);   opacity: 1; }
+  80%  { transform: scale(2.5); opacity: 0; }
+  100% { transform: scale(2.5); opacity: 0; }
+}
+.ping-rouge {
+  width: 14px; height: 14px;
+  background: #DC2626;
+  border-radius: 50%;
+  border: 2px solid white;
+  box-shadow: 0 0 0 0 rgba(220,38,38,0.6);
+  animation: ping 1.4s ease-out infinite;
+  position: absolute;
+  top: -18px; left: -7px;
+  pointer-events: none;
+  z-index: 9999;
+}
+</style>
+"""))
+
 fg_dc  = folium.FeatureGroup(name=f'🟠 Dents creuses ({len(dc_parc)})', show=True)
 fg_vid = folium.FeatureGroup(name=f'🔵 Terrains vides stricts ({len(vides)})', show=True)
 fg_sou = folium.FeatureGroup(name=f'🟣 Sous-exploités filtrés ({len(sous)})', show=True)
 fg_fri = folium.FeatureGroup(name=f'🔴 Friches ({len(gdf_friches)})', show=True)
-fg_vac = folium.FeatureGroup(name=f'🟤 Biens vacants ({len(parc_vacants)})', show=True)
+fg_fort = folium.FeatureGroup(name=f'🚨 Signal Fort ({nb_fort})', show=True)
 
 
-def ajouter(fg, gp, lat, lon, coul, col_f, icone, html, tip, sec, num):
+def ajouter(fg, gp, lat, lon, coul, col_f, icone, html, tip, sec, num, fort=False, fg_fort_ref=None):
     geom_wgs = gpd.GeoSeries([gp], crs='EPSG:2154').to_crs('EPSG:4326').iloc[0]
     folium.GeoJson(
         geom_wgs.__geo_interface__,
@@ -706,6 +862,17 @@ def ajouter(fg, gp, lat, lon, coul, col_f, icone, html, tip, sec, num):
             icon_size=(60,18), icon_anchor=(0,0)
         )
     ).add_to(fg)
+    # Fix 1 — fg_fort passé explicitement, pas pris depuis le contexte global
+    # Fix 5 — comparaison explicite au lieu de bool() fragile
+    if fort is True and fg_fort_ref is not None:
+        folium.Marker(
+            [lat, lon],
+            icon=folium.DivIcon(
+                html='<div class="ping-rouge"></div>',
+                icon_size=(14, 14),
+                icon_anchor=(7, 28)
+            )
+        ).add_to(fg_fort_ref)
 
 
 def get_gp_latlon(row):
@@ -748,7 +915,8 @@ for rang, (_, row) in enumerate(dc_parc.iterrows(), 1):
             f"<hr style='margin:5px 0'><b>Proprio :</b> {prop} ({type_prop(prop,sir)})<br>{sir_h}"
             f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a></div>"
         )
-        ajouter(fg_dc,gp,lat,lon,COUL_DC,'orange','arrow-up',html,f'#{rang} Dent creuse | {adr}',sec,num)
+        ajouter(fg_dc,gp,lat,lon,COUL_DC,'orange','arrow-up',html,f'#{rang} Dent creuse | {adr}',sec,num,
+                fort=row.get('signal_fort_score',0)>=SIGNAL_FORT_SEUIL, fg_fort_ref=fg_fort)
     except Exception as e:
         print(f'  ⚠️ DC {rang}: {e}')
 
@@ -775,7 +943,8 @@ for rang, (_, row) in enumerate(vides.iterrows(), 1):
             f"<hr style='margin:5px 0'><b>Proprio :</b> {prop} ({type_prop(prop,sir)})<br>{sir_h}"
             f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a></div>"
         )
-        ajouter(fg_vid,gp,lat,lon,COUL_VIDE,'blue','tint',html,f'#{rang} Vide | {adr}',sec,num)
+        ajouter(fg_vid,gp,lat,lon,COUL_VIDE,'blue','tint',html,f'#{rang} Vide | {adr}',sec,num,
+                fort=row.get('signal_fort_score',0)>=SIGNAL_FORT_SEUIL, fg_fort_ref=fg_fort)
     except Exception as e:
         print(f'  ⚠️ Vide {rang}: {e}')
 
@@ -805,7 +974,8 @@ for rang, (_, row) in enumerate(sous.iterrows(), 1):
             f"<hr style='margin:5px 0'><b>Proprio :</b> {prop} ({type_prop(prop,sir)})<br>{sir_h}"
             f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a></div>"
         )
-        ajouter(fg_sou,gp,lat,lon,COUL_SOUS,'purple','building',html,f'#{rang} Sous-exp. | {adr}',sec,num)
+        ajouter(fg_sou,gp,lat,lon,COUL_SOUS,'purple','building',html,f'#{rang} Sous-exp. | {adr}',sec,num,
+                fort=row.get('signal_fort_score',0)>=SIGNAL_FORT_SEUIL, fg_fort_ref=fg_fort)
     except Exception as e:
         print(f'  ⚠️ Sous {rang}: {e}')
 
@@ -848,42 +1018,77 @@ for rang, (_, row) in enumerate(gdf_friches.iterrows(), 1):
                 geom.__geo_interface__,
                 style_function=lambda x: {'color': COUL_FRICHE, 'weight': 2, 'fillOpacity': 0.3}
             ).add_to(fg_fri)
+        # Fix 2 — toutes les friches sont Signal Fort par définition
+        # (officiellement abandonnées dans la base CEREMA)
+        folium.Marker(
+            [lat, lon],
+            icon=folium.DivIcon(
+                html='<div class="ping-rouge"></div>',
+                icon_size=(14, 14),
+                icon_anchor=(7, 28)
+            )
+        ).add_to(fg_fort)
     except Exception as e:
         print(f'  ⚠️ Friche {rang}: {e}')
 
-# 🟤 Biens vacants
-print(f'Biens vacants ({len(parc_vacants)})...')
-for rang, (_, row) in enumerate(parc_vacants.iterrows(), 1):
+# 🚨 Vacants Signal Fort — affichés directement dans fg_fort
+vac_fort = parc_vacants[parc_vacants['signal_fort_score'] >= SIGNAL_FORT_SEUIL].copy()
+print(f'Vacants Signal Fort ({len(vac_fort)})...')
+for rang, (_, row) in enumerate(vac_fort.iterrows(), 1):
     try:
-        sec = str(row.get('section','')).strip()
-        num = str(row.get('numero','')).strip()
-        surf = int(row['contenance']) if pd.notna(row.get('contenance')) else '?'
-        adr = str(row.get('adresse','') or 'Adresse inconnue')
-        prop = str(row.get('denomination','Particulier'))
-        sir = str(row.get('siren','') or '')
-        emp = round(float(row.get('emprise_ratio',0) or 0) * 100, 1)
+        sec   = str(row.get('section','')).strip()
+        num   = str(row.get('numero','')).strip()
+        surf  = int(row['contenance']) if pd.notna(row.get('contenance')) else '?'
+        adr   = str(row.get('adresse','') or 'Adresse inconnue')
+        prop  = str(row.get('denomination','Particulier'))
+        sir   = str(row.get('siren','') or '')
+        emp   = round(float(row.get('emprise_ratio',0) or 0)*100, 1)
+        score = int(row.get('signal_fort_score', 0))
+        cle   = row.get('cle','')
         gp, lat, lon = get_gp_latlon(row)
-        gm, ge, sir_h = popup_base(rang,'Vacant',COUL_VACANT,adr,sec,num,surf,emp,prop,sir)
+        ae = urllib.parse.quote(adr)
+        gm = f'https://www.google.com/maps/search/?api=1&query={ae}'
+        ge = f'https://earth.google.com/web/search/{ae}'
+        sir_h = f"<b>SIREN :</b> {sir}<br>" if sir and sir not in ('','nan') else ''
+
+        signaux = []
+        if cle in cles_demembrement: signaux.append('✓ Démembrement (succession)')
+        if cle in cles_friches:      signaux.append('✓ Friche répertoriée')
+        if sir and sir not in ('','nan'): signaux.append('✓ Société identifiée')
+        signaux.append(f'✓ Aucune vente DVF depuis {ANNEE_DVF_DEBUT}')
+        # Indivision — info seulement, pas dans le score
+        if cle in cles_multi_sans_synd:
+            signaux.append('ℹ️ Plusieurs entités sur la parcelle (sans syndic)')
+
         html = (
-            f"<div style='font-family:Arial;font-size:13px;min-width:270px;line-height:1.9'>"
-            f"<b style='font-size:15px;color:{COUL_VACANT}'>#{rang} Bien potentiellement vacant</b><br>"
+            f"<div style='font-family:Arial;font-size:13px;min-width:280px;line-height:1.9'>"
+            f"<b style='font-size:15px;color:#DC2626'>🚨 Signal Fort ({score} signaux)</b><br>"
             f"<a href='{gm}' target='_blank' style='color:#1a6fb5;font-weight:bold;text-decoration:none'>📍 {adr}</a><br><br>"
             f"<b>Parcelle :</b> {sec} n°{num} | <b>Surface :</b> {surf} m²<br>"
             f"<b>Emprise bâtie :</b> {emp}%"
             f"<hr style='margin:5px 0'><b>Proprio :</b> {prop} ({type_prop(prop,sir)})<br>{sir_h}"
-            f"<hr style='margin:5px 0'>✓ Pleine propriété<br>✓ Aucune vente DVF depuis {ANNEE_DVF_DEBUT}<br>✓ Emprise modérée ({emp}%)"
-            f"<hr style='margin:5px 0'><i style='font-size:11px;color:#888'>⚠️ À vérifier sur place</i>"
+            f"<hr style='margin:5px 0'>{'<br>'.join(signaux)}"
             f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a></div>"
         )
-        ajouter(fg_vac,gp,lat,lon,COUL_VACANT,'darkred','question',html,f'#{rang} Vacant | {adr}',sec,num)
+        geom_wgs = gpd.GeoSeries([gp], crs='EPSG:2154').to_crs('EPSG:4326').iloc[0]
+        folium.GeoJson(
+            geom_wgs.__geo_interface__,
+            style_function=lambda x: {'color':'#DC2626','weight':2,'fillOpacity':0.4}
+        ).add_to(fg_fort)
+        folium.Marker(
+            [lat, lon],
+            popup=folium.Popup(html, max_width=330),
+            tooltip=f'🚨 Signal Fort | {adr} | {score} signaux',
+            icon=folium.Icon(color='red', icon='exclamation', prefix='fa')
+        ).add_to(fg_fort)
     except Exception as e:
-        print(f'  ⚠️ Vacant {rang}: {e}')
+        print(f'  ⚠️ Vacant fort {rang}: {e}')
 
-for fg in [fg_dc, fg_vid, fg_sou, fg_fri, fg_vac]:
+for fg in [fg_dc, fg_vid, fg_sou, fg_fri, fg_fort]:
     fg.add_to(carte)
 folium.LayerControl(collapsed=False, position='topright').add_to(carte)
 
-total = len(dc_parc)+len(vides)+len(sous)+len(gdf_friches)+len(parc_vacants)
+total = len(dc_parc)+len(vides)+len(sous)+len(gdf_friches)
 carte.get_root().html.add_child(folium.Element(
     f"<div style='position:fixed;bottom:30px;left:30px;z-index:1000;"
     f"background:white;padding:14px 18px;border-radius:10px;"
@@ -894,11 +1099,14 @@ carte.get_root().html.add_child(folium.Element(
     f"<span style='color:{COUL_VIDE}'>&#9679;</span> Terrains vides stricts {len(vides)}<br>"
     f"<span style='color:{COUL_SOUS}'>&#9679;</span> Sous-exploités filtrés {len(sous)}<br>"
     f"<span style='color:{COUL_FRICHE}'>&#9679;</span> Friches {len(gdf_friches)}<br>"
-    f"<span style='color:{COUL_VACANT}'>&#9679;</span> Biens vacants {len(parc_vacants)}"
+    f"<hr style='margin:6px 0'>"
+    f"<span style='color:#DC2626'>&#9679;</span> <b>Signal Fort</b> {nb_fort}"
+    f"<i style='color:#999;font-size:10px;display:block;margin-top:3px'>"
+    f"≥{SIGNAL_FORT_SEUIL} signaux — ping rouge + marqueurs dédiés</i>"
     f"</div>"
 ))
 
-print(f'✅ Carte affichée — {total} opportunités')
+print(f'✅ Carte affichée — {total} opportunités + {nb_fort} Signal Fort')
 os.makedirs(os.path.dirname(OUTPUT_HTML), exist_ok=True)
 carte.save(OUTPUT_HTML)
 print(f'✅ HTML généré : {OUTPUT_HTML}')
@@ -920,11 +1128,11 @@ try:
         return df
 
     for _df, _cat in [
-        (dc_parc, 'Dent creuse'),
-        (vides, 'Terrain vide'),
-        (sous, 'Sous-exploité'),
-        (gdf_friches, 'Friche'),
-        (parc_vacants, 'Bien vacant'),
+        (dc_parc,    'Dent creuse'),
+        (vides,      'Terrain vide'),
+        (sous,       'Sous-exploité'),
+        (gdf_friches,'Friche'),
+        (vac_fort,   'Signal Fort vacant'),
     ]:
         e = _prep_export(_df, _cat)
         if e is not None:
