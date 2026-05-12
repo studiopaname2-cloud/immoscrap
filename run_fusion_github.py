@@ -53,9 +53,10 @@ BATI_MAX_SOUS_M2 = 220.0
 NB_BAT_MAX_SOUS  = 2
 
 # Biens vacants
-ANNEE_DVF_DEBUT    = 2014
-ANNEE_DVF_FIN      = 2023
-EMPRISE_VACANT_MIN = 0.01
+ANNEE_DVF_DEBUT      = 2014
+ANNEE_DVF_FIN        = 2023
+DVF_MIN_ANNEES_ALERTE = 3
+EMPRISE_VACANT_MIN   = 0.01
 EMPRISE_VACANT_MAX = 0.35
 NATURES_OK = ['Maison','Terrain','Sol',
     'Local industriel. commercial ou assimilé',
@@ -80,6 +81,17 @@ DOM_PUBLIC = [
 
 DEPT = CODE_INSEE[:2]
 print(f'Commune : {CODE_INSEE}')
+
+
+def resume_annees(annees):
+    annees = sorted(int(a) for a in annees if pd.notna(a))
+    if not annees:
+        return 'aucune'
+    if len(annees) == 1:
+        return str(annees[0])
+    if all(b - a == 1 for a, b in zip(annees, annees[1:])):
+        return f'{annees[0]}–{annees[-1]}'
+    return ', '.join(str(a) for a in annees)
 
 
 # Contour commune
@@ -520,6 +532,11 @@ for annee in range(ANNEE_DVF_DEBUT, ANNEE_DVF_FIN + 1):
         print(f'  {annee} ❌ {str(e)[:50]}')
     time.sleep(0.3)
 
+annees_dvf_dispo = [int(x['annee']) for x in dvf_stats if x['status'] == 200]
+annees_dvf_ko = [f"{x['annee']} ({x['status']})" for x in dvf_stats if x['status'] != 200]
+periode_dvf_label = resume_annees(annees_dvf_dispo)
+dvf_alerte_active = len(annees_dvf_dispo) >= DVF_MIN_ANNEES_ALERTE
+
 if dvf_frames:
     dvf = pd.concat(dvf_frames, ignore_index=True)
     dvf['section_dvf'] = dvf['id_parcelle'].astype(str).str[8:10].str.strip()
@@ -537,27 +554,30 @@ if dvf_frames:
         'valeur_fonciere': 'dernier_prix'
     })
 
-    print(f'\n✅ {len(cles_avec_mutation)} parcelles avec mutation depuis {ANNEE_DVF_DEBUT}')
+    print(f'\n✅ {len(cles_avec_mutation)} parcelles avec mutation sur période DVF disponible ({periode_dvf_label})')
     print(f'   Types : {dvf["nature_mutation"].value_counts().to_dict()}')
 else:
     cles_avec_mutation = set()
     dvf_last = pd.DataFrame()
     print('⚠️ DVF non chargé')
 
-annees_ok = [str(x['annee']) for x in dvf_stats if x['status'] == 200]
-annees_ko = [f"{x['annee']} ({x['status']})" for x in dvf_stats if x['status'] != 200]
-print(f"DVF années OK : {', '.join(annees_ok) if annees_ok else 'aucune'}")
-if annees_ko:
-    print(f"DVF années manquantes / erreurs : {', '.join(annees_ko)}")
+print(f"DVF années OK : {periode_dvf_label}")
+if annees_dvf_ko:
+    print(f"DVF années manquantes / erreurs : {', '.join(annees_dvf_ko)}")
 else:
-    print('DVF : toutes les années 2014–2023 sont bien revenues pour cette commune')
+    print(f'DVF : toutes les années {ANNEE_DVF_DEBUT}–{ANNEE_DVF_FIN} sont revenues pour cette commune')
+
+if dvf_alerte_active:
+    print(f"✅ Alerte DVF active sur la période disponible ({periode_dvf_label})")
+else:
+    print(f"⚠️ Alerte DVF désactivée : seulement {len(annees_dvf_dispo)} année(s) disponible(s)")
 
 DATE_ACHAT_RECENTE = pd.Timestamp.today().normalize() - pd.DateOffset(years=5)
 if len(dvf_last) > 0:
     cles_achat_recent = set(
         dvf_last[dvf_last['derniere_mutation_date'] >= DATE_ACHAT_RECENTE]['cle']
     )
-    print(f"✅ {len(cles_achat_recent)} parcelles achetées il y a moins de 5 ans exclues")
+    print(f"✅ {len(cles_achat_recent)} parcelles achetées il y a moins de 5 ans exclues (selon DVF disponible)")
 else:
     cles_achat_recent = set()
 
@@ -693,7 +713,7 @@ print(f'\n✅ Total affiché : {total_affiche} opportunités (hors vacants Signa
 # ══════════════════════════════════════════════════════
 # ALERTE COMPLÉMENTAIRE — score simple
 #
-# +1  Aucune vente DVF depuis 2014
+# +1  Aucune vente DVF sur période disponible
 # +1  Démembrement (nu-proprio + usufruitier)
 #
 # 2 points = !!
@@ -723,7 +743,7 @@ if len(gdf_friches) > 0:
 # On ne le compte donc que pour les autres catégories
 def score_signal_fort(cle, compter_dvf=True):
     score = 0
-    if compter_dvf and cle not in cles_avec_mutation:
+    if compter_dvf and dvf_alerte_active and cle not in cles_avec_mutation:
         score += 1
     if cle in cles_demembrement:
         score += 1
@@ -858,7 +878,11 @@ def type_prop(p, s):
 
 def format_derniere_mutation(date_val):
     if pd.isna(date_val) or str(date_val) in ('', 'nan', 'NaT'):
-        return f'Aucune vente DVF depuis {ANNEE_DVF_DEBUT}'
+        if dvf_alerte_active:
+            return f'Aucune vente DVF sur période disponible ({periode_dvf_label})'
+        if annees_dvf_dispo:
+            return f'DVF partiel disponible ({periode_dvf_label})'
+        return 'DVF indisponible'
     try:
         return pd.to_datetime(date_val).strftime('%d/%m/%Y')
     except Exception:
@@ -1150,8 +1174,8 @@ for rang, (idx, row) in enumerate(gdf_friches.iterrows(), 1):
         if row.get('signal_fort_score', 0) >= ALERTE_MIN_SEUIL:
             badge = row.get('signal_fort_badge', '!')
             signaux = []
-            if row.get('cle', '') and row.get('cle', '') not in cles_avec_mutation:
-                signaux.append(f'✓ Aucune vente DVF depuis {ANNEE_DVF_DEBUT}')
+            if dvf_alerte_active and row.get('cle', '') and row.get('cle', '') not in cles_avec_mutation:
+                signaux.append(f'✓ Aucune vente DVF sur période disponible ({periode_dvf_label})')
             if row.get('cle', '') in cles_demembrement:
                 signaux.append('✓ Démembrement (succession)')
             alerte_html = (
