@@ -29,7 +29,7 @@ CHEMIN_MAJIC  = os.environ.get('CHEMIN_MAJIC', 'data/majic.parquet')
 CHEMIN_LOCAUX = os.environ.get('CHEMIN_LOCAUX', 'data/locaux.parquet')
 
 # Signal Fort — score minimum pour afficher le ping rouge
-ALERTE_MIN_SEUIL = 1   # 1 signal = ! | 2 signaux = !!
+ALERTE_MIN_SEUIL = 2   # alerte affichée seulement à 2 signaux = !!
 
 # Dents creuses
 HAUT_MAX_DC         = 7.0
@@ -64,7 +64,7 @@ NATURES_OK = ['Maison','Terrain','Sol',
 # Couleurs
 COUL_DC     = '#E8820C'
 COUL_VIDE   = '#16A34A'
-COUL_SOUS   = '#EAB308'
+COUL_SOUS   = '#2563EB'
 COUL_FRICHE = '#DC2626'
 COUL_VACANT = '#92400E'
 
@@ -540,6 +540,15 @@ else:
     dvf_last = pd.DataFrame()
     print('⚠️ DVF non chargé')
 
+DATE_ACHAT_RECENTE = pd.Timestamp.today().normalize() - pd.DateOffset(years=5)
+if len(dvf_last) > 0:
+    cles_achat_recent = set(
+        dvf_last[dvf_last['derniere_mutation_date'] >= DATE_ACHAT_RECENTE]['cle']
+    )
+    print(f"✅ {len(cles_achat_recent)} parcelles achetées il y a moins de 5 ans exclues")
+else:
+    cles_achat_recent = set()
+
 
 # Analyse : 4 catégories
 print('Analyse...')
@@ -561,6 +570,16 @@ else:
     parc_pp['denomination'] = 'Particulier'
     parc_pp['siren']        = ''
 
+if len(dvf_last) > 0:
+    parc_pp = parc_pp.merge(
+        dvf_last[['cle', 'derniere_mutation_date', 'derniere_mutation_type']],
+        on='cle', how='left'
+    )
+else:
+    parc_pp['derniere_mutation_date'] = pd.NaT
+    parc_pp['derniere_mutation_type'] = ''
+
+parc_pp = parc_pp[~parc_pp['cle'].isin(cles_achat_recent)].copy()
 print(f'  {len(parc_pp)} parcelles pleine propriété privée')
 
 # Catégorie 1 : Terrains vides stricts
@@ -633,6 +652,7 @@ sous    = sous.merge(parc_geom, on='cle', how='left')
 candidats = parcelles.copy()
 # Exclure uniquement les vraies copropriétés (syndic identifié)
 candidats = candidats[~candidats['cle'].isin(cles_syndic)].copy()
+candidats = candidats[~candidats['cle'].isin(cles_achat_recent)].copy()
 if cles_avec_mutation:
     candidats = candidats[~candidats['cle'].isin(cles_avec_mutation)].copy()
 candidats = candidats[
@@ -664,7 +684,6 @@ print(f'\n✅ Total affiché : {total_affiche} opportunités (hors vacants Signa
 # +1  Aucune vente DVF depuis 2014
 # +1  Démembrement (nu-proprio + usufruitier)
 #
-# 1 point  = !
 # 2 points = !!
 # ══════════════════════════════════════════════════════
 print('Calcul alertes complémentaires...')
@@ -775,10 +794,11 @@ if len(gdf_friches) > 0:
         fr_pts['geometry'] = fr_pts.geometry.centroid
         fr_join = gpd.sjoin(
             fr_pts[['friche_idx', 'geometry']],
-            parcelles[['cle', 'section', 'numero', 'contenance', 'geometry']],
+            parc_pp[['cle', 'section', 'numero', 'contenance', 'denomination', 'siren',
+                     'derniere_mutation_date', 'derniere_mutation_type', 'geometry']],
             how='left', predicate='within'
         ).drop(columns='index_right', errors='ignore')
-        parc_geom_fri = parcelles[['cle', 'geometry']].rename(columns={'geometry': 'geom_parcelle'})
+        parc_geom_fri = parc_pp[['cle', 'geometry']].rename(columns={'geometry': 'geom_parcelle'})
         fr_join = fr_join.merge(parc_geom_fri, on='cle', how='left')
         friche_parc_map = fr_join.set_index('friche_idx').to_dict('index')
     except Exception as e:
@@ -788,6 +808,11 @@ if len(gdf_friches) > 0:
 if len(gdf_friches) > 0:
     gdf_friches = gdf_friches.copy()
     gdf_friches['cle'] = gdf_friches.index.map(lambda i: friche_parc_map.get(i, {}).get('cle', ''))
+    gdf_friches = gdf_friches[~gdf_friches['cle'].isin(cles_achat_recent)].copy()
+    friche_parc_map = {
+        k: v for k, v in friche_parc_map.items()
+        if str(v.get('cle', '')) not in cles_achat_recent
+    }
     gdf_friches = ajouter_score(gdf_friches, compter_dvf=True)
 else:
     gdf_friches['signal_fort_score'] = []
@@ -800,7 +825,7 @@ nb_fort = int(sum([
     sous['signal_fort'].sum(),
     gdf_friches['signal_fort'].sum() if 'signal_fort' in gdf_friches.columns else 0
 ]))
-print(f'✅ {nb_fort} biens avec alerte complémentaire (! ou !!)')
+print(f'✅ {nb_fort} biens avec alerte complémentaire (!! uniquement)')
 
 
 def niveau(h):
@@ -817,6 +842,15 @@ def type_prop(p, s):
     if p in ('Particulier','Inconnu','N/A',''):
         return 'Particulier'
     return 'Société'
+
+
+def format_derniere_mutation(date_val):
+    if pd.isna(date_val) or str(date_val) in ('', 'nan', 'NaT'):
+        return f'Aucune vente DVF depuis {ANNEE_DVF_DEBUT}'
+    try:
+        return pd.to_datetime(date_val).strftime('%d/%m/%Y')
+    except Exception:
+        return str(date_val)
 
 
 centre = parcelles.to_crs(epsg=4326).geometry.centroid.unary_union.centroid
@@ -855,8 +889,8 @@ carte.get_root().html.add_child(folium.Element("""
 """))
 
 fg_dc  = folium.FeatureGroup(name=f'🟠 Dents creuses ({len(dc_parc)})', show=True)
-fg_vid = folium.FeatureGroup(name=f'🔵 Terrains vides stricts ({len(vides)})', show=True)
-fg_sou = folium.FeatureGroup(name=f'🟣 Sous-exploités filtrés ({len(sous)})', show=True)
+fg_vid = folium.FeatureGroup(name=f'🟢 Terrains vides stricts ({len(vides)})', show=True)
+fg_sou = folium.FeatureGroup(name=f'🔵 Sous-exploités filtrés ({len(sous)})', show=True)
 fg_fri = folium.FeatureGroup(name=f'🔴 Friches ({len(gdf_friches)})', show=True)
 fg_fort = folium.FeatureGroup(name=f'🩷 Alertes complémentaires ({nb_fort})', show=True)
 
@@ -943,6 +977,7 @@ for rang, (_, row) in enumerate(dc_parc.iterrows(), 1):
         vois = round(float(row.get('haut_voisin_max',0) or 0), 1)
         ecar = round(float(row.get('ecart_max',0) or 0), 1)
         emp = round(float(row.get('emprise_ratio',0) or 0) * 100, 1)
+        mut = format_derniere_mutation(row.get('derniere_mutation_date'))
         gp, lat, lon = get_gp_latlon(row)
         gm, ge, sir_h = popup_base(rang,'DC',COUL_DC,adr,sec,num,surf,emp,prop,sir)
         html = (
@@ -952,6 +987,7 @@ for rang, (_, row) in enumerate(dc_parc.iterrows(), 1):
             f"<b>Parcelle :</b> {sec} n°{num} | <b>Surface :</b> {surf} m²<br>"
             f"<b>Emprise :</b> {emp}% | <b>Haut :</b> {haut}m | <b>Voisin :</b> {vois}m | <b style='color:{COUL_DC}'>Écart : {ecar}m</b>"
             f"<hr style='margin:5px 0'><b>Proprio :</b> {prop} ({type_prop(prop,sir)})<br>{sir_h}"
+            f"<b>Dernière mutation :</b> {mut}<br>"
             f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a></div>"
         )
         ajouter(fg_dc,gp,lat,lon,COUL_DC,'orange','arrow-up',html,f'#{rang} Dent creuse | {adr}',sec,num,
@@ -971,6 +1007,7 @@ for rang, (_, row) in enumerate(vides.iterrows(), 1):
         sir = str(row.get('siren','') or '')
         emp = round(float(row.get('emprise_ratio',0) or 0) * 100, 1)
         emp_m2 = round(float(row.get('emprise_m2',0) or 0), 1)
+        mut = format_derniere_mutation(row.get('derniere_mutation_date'))
         gp, lat, lon = get_gp_latlon(row)
         gm, ge, sir_h = popup_base(rang,'Vide',COUL_VIDE,adr,sec,num,surf,emp,prop,sir)
         html = (
@@ -980,6 +1017,7 @@ for rang, (_, row) in enumerate(vides.iterrows(), 1):
             f"<b>Parcelle :</b> {sec} n°{num} | <b>Surface :</b> {surf} m²<br>"
             f"<b>Emprise PCI :</b> {emp}% | <b>Bâti détecté :</b> {emp_m2} m² max"
             f"<hr style='margin:5px 0'><b>Proprio :</b> {prop} ({type_prop(prop,sir)})<br>{sir_h}"
+            f"<b>Dernière mutation :</b> {mut}<br>"
             f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a></div>"
         )
         ajouter(fg_vid,gp,lat,lon,COUL_VIDE,'green','tint',html,f'#{rang} Vide | {adr}',sec,num,
@@ -1001,6 +1039,7 @@ for rang, (_, row) in enumerate(sous.iterrows(), 1):
         emp = round(float(row.get('emprise_ratio',0) or 0) * 100, 1)
         emp_m2 = round(float(row.get('emprise_m2',0) or 0), 1)
         nb_bat = int(row.get('nb_bat_pci', 0) or 0)
+        mut = format_derniere_mutation(row.get('derniere_mutation_date'))
         gp, lat, lon = get_gp_latlon(row)
         gm, ge, sir_h = popup_base(rang,'Sous',COUL_SOUS,adr,sec,num,surf,emp,prop,sir)
         html = (
@@ -1011,9 +1050,10 @@ for rang, (_, row) in enumerate(sous.iterrows(), 1):
             f"<b>Emprise :</b> {emp}% | <b>Surface bâtie :</b> {emp_m2} m² | <b>Nb bâtis :</b> {nb_bat}<br>"
             f"<b>Haut. min :</b> {haut}m"
             f"<hr style='margin:5px 0'><b>Proprio :</b> {prop} ({type_prop(prop,sir)})<br>{sir_h}"
+            f"<b>Dernière mutation :</b> {mut}<br>"
             f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a></div>"
         )
-        ajouter(fg_sou,gp,lat,lon,COUL_SOUS,'orange','building',html,f'#{rang} Sous-exp. | {adr}',sec,num,
+        ajouter(fg_sou,gp,lat,lon,COUL_SOUS,'blue','building',html,f'#{rang} Sous-exp. | {adr}',sec,num,
                 fort=row.get('signal_fort_score',0)>=ALERTE_MIN_SEUIL, badge=row.get('signal_fort_badge',''), fg_fort_ref=fg_fort)
     except Exception as e:
         print(f'  ⚠️ Sous {rang}: {e}')
@@ -1041,7 +1081,9 @@ for rang, (idx, row) in enumerate(gdf_friches.iterrows(), 1):
             f"<b>{nom}</b><br>"
             f"<a href='{gm}' target='_blank' style='color:#1a6fb5;font-weight:bold;text-decoration:none'>📍 {adr}</a><br><br>"
             f"<b>Type :</b> {typ} | <b>Statut :</b> {stat}<br>"
-            f"<b>Surface :</b> {surf} m² | <b>Proprio :</b> {prop_f}<br>"
+            f"<b>Surface :</b> {surf} m² | <b>Proprio site :</b> {prop_f}<br>"
+            f"{f'<b>Proprio parcelle :</b> {prop_parc}<br>' if prop_parc else ''}"
+            f"{f'<b>Dernière mutation :</b> {mut_parc}<br>' if sec or num else ''}"
             f"<b>Source :</b> Cartofriches CEREMA"
             f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a>"
             f"{'<br><br><a href=' + repr(url_f) + ' target=_blank style=font-size:11px;color:#666>Fiche →</a>' if url_f else ''}"
@@ -1053,6 +1095,8 @@ for rang, (idx, row) in enumerate(gdf_friches.iterrows(), 1):
         num = str(infos_parc.get('numero', '') or '').strip()
         surf_parc = infos_parc.get('contenance')
         surf_parc = int(surf_parc) if pd.notna(surf_parc) else '?'
+        prop_parc = str(infos_parc.get('denomination', '') or '').strip()
+        mut_parc = format_derniere_mutation(infos_parc.get('derniere_mutation_date'))
 
         if gp is not None:
             geom_wgs = gpd.GeoSeries([gp], crs='EPSG:2154').to_crs('EPSG:4326').iloc[0]
@@ -1098,6 +1142,8 @@ for rang, (idx, row) in enumerate(gdf_friches.iterrows(), 1):
                 f"<b style='color:{COUL_FRICHE}'>Friche répertoriée</b><br>"
                 f"<a href='{gm}' target='_blank' style='color:#1a6fb5;font-weight:bold;text-decoration:none'>📍 {adr}</a><br><br>"
                 f"{f'<b>Parcelle :</b> {sec} n°{num} | <b>Surface parcelle :</b> {surf_parc} m²<br>' if sec or num else ''}"
+                f"{f'<b>Proprio parcelle :</b> {prop_parc}<br>' if prop_parc else ''}"
+                f"{f'<b>Dernière mutation :</b> {mut_parc}<br>' if sec or num else ''}"
                 f"<b>Site :</b> {nom}<br>"
                 f"<b>Type :</b> {typ} | <b>Statut :</b> {stat}<br>"
                 f"<hr style='margin:5px 0'>{'<br>'.join(signaux) if signaux else 'Alerte complémentaire'}"
@@ -1125,11 +1171,11 @@ carte.get_root().html.add_child(folium.Element(
     f"<hr style='margin:6px 0'>"
     f"<span style='color:#EC4899'>&#9679;</span> <b>Alertes complémentaires</b> {nb_fort}"
     f"<i style='color:#999;font-size:10px;display:block;margin-top:3px'>"
-    f"1 point = ! | 2 points = !!</i>"
+    f"2 points = !!</i>"
     f"</div>"
 ))
 
-print(f'✅ Carte affichée — {total} opportunités + {nb_fort} alertes complémentaires')
+print(f'✅ Carte affichée — {total} opportunités + {nb_fort} alertes complémentaires (!! uniquement)')
 os.makedirs(os.path.dirname(OUTPUT_HTML), exist_ok=True)
 carte.save(OUTPUT_HTML)
 print(f'✅ HTML généré : {OUTPUT_HTML}')
