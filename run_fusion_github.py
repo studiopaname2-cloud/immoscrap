@@ -28,23 +28,41 @@ CODE_INSEE    = os.environ.get('CODE_INSEE', '93048')
 CHEMIN_MAJIC  = os.environ.get('CHEMIN_MAJIC', 'data/majic.parquet')
 CHEMIN_LOCAUX = os.environ.get('CHEMIN_LOCAUX', 'data/locaux.parquet')
 
+# Blocage 6 — Normalisation code INSEE
+# Certains fichiers parquet stockent '93048', d'autres '093048'
+# On normalise toujours en string 5 chiffres
+CODE_INSEE = str(CODE_INSEE).strip().zfill(5)
+DEPT       = CODE_INSEE[:2]
+
 # Signal Fort — score minimum pour afficher le ping rouge
-ALERTE_MIN_SEUIL = 2   # alerte affichée seulement à 2 signaux = !!
+SIGNAL_FORT_SEUIL = 2
 
 # Dents creuses
 HAUT_MAX_DC         = 7.0
 ECART_HAUTEUR_MIN_M = 6.0
 
 # Emprise — version corrigée et plus stricte
-EMPRISE_VIDE_MAX    = 0.01   # 1%
-EMPRISE_VIDE_M2_MAX = 8.0    # max 8 m² bâtis pour rester "terrain vide"
-EMPRISE_SOUS_MIN    = 0.12   # 12%
-EMPRISE_SOUS_MAX    = 0.25   # 25%
+EMPRISE_VIDE_MAX    = 0.01
+EMPRISE_VIDE_M2_MAX = 8.0
+EMPRISE_SOUS_MIN    = 0.12
+EMPRISE_SOUS_MAX    = 0.25
 
-# Parcelles
+# Parcelles — seuils de base
 SURFACE_MIN_M2 = 120
 SURFACE_MAX_M2 = 2500
 COMPACITE_MIN  = 0.18
+
+# Blocage 5 — Surface max adaptée par commune
+# Saint-Ouen et Aubervilliers ont de grandes parcelles industrielles
+# qu'on ne veut pas rater avec le seuil standard de 2500 m²
+SURFACE_MAX_PAR_COMMUNE = {
+    '93070': 8000,   # Saint-Ouen — grande zone industrielle
+    '93001': 8000,   # Aubervilliers — Plaine Saint-Denis
+    '93055': 5000,   # Pantin — quelques grandes parcelles
+    '93053': 5000,   # Noisy-le-Sec
+}
+SURFACE_MAX_M2 = SURFACE_MAX_PAR_COMMUNE.get(CODE_INSEE, SURFACE_MAX_M2)
+print(f'  Surface max pour {CODE_INSEE} : {SURFACE_MAX_M2} m²')
 
 # Bâtiments / emprise
 BATI_MIN_PCI_M2  = 8.0   # ignore les micro-artefacts
@@ -57,15 +75,15 @@ ANNEE_DVF_DEBUT      = 2014
 ANNEE_DVF_FIN        = 2023
 DVF_MIN_ANNEES_ALERTE = 3
 EMPRISE_VACANT_MIN   = 0.01
-EMPRISE_VACANT_MAX = 0.35
+EMPRISE_VACANT_MAX   = 0.35
 NATURES_OK = ['Maison','Terrain','Sol',
     'Local industriel. commercial ou assimilé',
     'Dépendance','Bâtiment industriel']
 
 # Couleurs
 COUL_DC     = '#E8820C'
-COUL_VIDE   = '#16A34A'
-COUL_SOUS   = '#2563EB'
+COUL_VIDE   = '#2563EB'
+COUL_SOUS   = '#7C3AED'
 COUL_FRICHE = '#DC2626'
 COUL_VACANT = '#92400E'
 
@@ -79,8 +97,7 @@ DOM_PUBLIC = [
     'RFF','VNF','UNIVERSITE','LYCEE','HOPITAL','CHU','APHP'
 ]
 
-DEPT = CODE_INSEE[:2]
-print(f'Commune : {CODE_INSEE}')
+print(f'Commune : {CODE_INSEE} | Département : {DEPT} | Surface max : {SURFACE_MAX_M2} m²')
 
 
 def resume_annees(annees):
@@ -210,24 +227,50 @@ print(f'✅ BD TOPO : {len(bat_dc)} bâtiments avec hauteur | {round(time.time()
 
 
 # Parcelles cadastrales
+# Parcelles cadastrales — avec pagination (l'API plafonne à 1000 par requête)
 def charger_parcelles(code, essais=5, delai=15):
-    url = f'https://apicarto.ign.fr/api/cadastre/parcelle?code_insee={code}'
-    for i in range(1, essais+1):
-        try:
-            print(f'  Essai {i}/{essais}...')
-            r = requests.get(url, timeout=60)
-            r.raise_for_status()
-            gdf = gpd.GeoDataFrame.from_features(r.json()['features'], crs='EPSG:4326')
-            if len(gdf) == 0:
-                raise ValueError('0 parcelles')
-            print(f'  ✅ {len(gdf)} parcelles')
-            return gdf
-        except Exception as e:
-            print(f'  ❌ {str(e)[:80]}')
-            if i < essais:
-                print(f'  Retry dans {delai}s...')
-                time.sleep(delai)
-    raise Exception('Cadastre inaccessible')
+    toutes = []
+    offset = 0
+    limit  = 1000
+    while True:
+        url = (
+            f'https://apicarto.ign.fr/api/cadastre/parcelle'
+            f'?code_insee={code}&_limit={limit}&_offset={offset}'
+        )
+        succes = False
+        for i in range(1, essais + 1):
+            try:
+                print(f'  Essai {i}/{essais} (offset={offset})...')
+                r = requests.get(url, timeout=60)
+                r.raise_for_status()
+                features = r.json().get('features', [])
+                toutes.extend(features)
+                print(f'  +{len(features)} parcelles (total : {len(toutes)})')
+                succes = True
+                break
+            except Exception as e:
+                print(f'  ❌ {str(e)[:80]}')
+                if i < essais:
+                    print(f'  Retry dans {delai}s...')
+                    time.sleep(delai)
+
+        if not succes:
+            # On ne plante pas — on travaille avec ce qu'on a
+            print(f'  ⚠️ Pagination interrompue à offset={offset} — on continue avec {len(toutes)} parcelles')
+            break
+
+        if len(features) < limit:
+            break   # Dernière page atteinte
+        offset += limit
+        time.sleep(1)  # Respecter le rate limit IGN entre pages
+
+    if len(toutes) == 0:
+        print(f'  ⚠️ Aucune parcelle récupérée pour {code} — carte vide possible')
+        return gpd.GeoDataFrame(columns=['geometry','section','numero','contenance'], crs='EPSG:4326')
+
+    gdf = gpd.GeoDataFrame.from_features(toutes, crs='EPSG:4326')
+    print(f'  ✅ {len(gdf)} parcelles au total')
+    return gdf
 
 
 print(f'Parcelles {CODE_INSEE}...')
@@ -448,48 +491,75 @@ print(f'   Terrains vides stricts : {((parcelles["emprise_ratio"] <= EMPRISE_VID
 print(f'   Sous-exploités filtrés : {parcelles["emprise_ratio"].between(EMPRISE_SOUS_MIN, EMPRISE_SOUS_MAX).sum()}')
 
 
-# Cartofriches CEREMA
+# Cartofriches CEREMA — avec cache disque
+# Sur 9 communes dans le même workflow : téléchargé une seule fois
 print('Cartofriches...')
-url_carto = 'https://static.data.gouv.fr/resources/sites-references-dans-cartofriches/20250422-125540/friches-standard.csv'
-r = requests.get(url_carto, timeout=120)
-r.raise_for_status()
-carto_all = pd.read_csv(io.StringIO(r.text), sep=';', low_memory=False)
+CACHE_CARTO = '/tmp/cartofriches_cache.csv'
+url_carto   = (
+    'https://static.data.gouv.fr/resources/sites-references-dans-cartofriches'
+    '/20250422-125540/friches-standard.csv'
+)
+try:
+    if os.path.exists(CACHE_CARTO):
+        print('  Cache trouvé — lecture locale')
+        carto_all = pd.read_csv(CACHE_CARTO, sep=';', low_memory=False)
+    else:
+        print('  Téléchargement Cartofriches...')
+        r = requests.get(url_carto, timeout=120)
+        r.raise_for_status()
+        with open(CACHE_CARTO, 'w', encoding='utf-8') as f:
+            f.write(r.text)
+        carto_all = pd.read_csv(io.StringIO(r.text), sep=';', low_memory=False)
+        print(f'  Cache écrit : {CACHE_CARTO}')
+except Exception as e:
+    print(f'  ⚠️ Cartofriches inaccessible : {e} — friches désactivées')
+    carto_all = pd.DataFrame()
 
-col_insee  = next((c for c in carto_all.columns if 'insee' in c.lower()), None)
-col_nom    = next((c for c in carto_all.columns if 'nom' in c.lower() and 'site' in c.lower()), None)
-col_adr    = next((c for c in carto_all.columns if 'adresse' in c.lower()), None)
-col_surf   = next((c for c in carto_all.columns if 'surface' in c.lower()), None)
-col_type   = next((c for c in carto_all.columns if 'type' in c.lower() and 'site' in c.lower()), None)
-col_statut = next((c for c in carto_all.columns if 'statut' in c.lower()), None)
-col_url    = next((c for c in carto_all.columns if 'url' in c.lower()), None)
-col_prop   = next((c for c in carto_all.columns if 'proprio' in c.lower() or 'proprietaire' in c.lower()), None)
-
-friches = carto_all[carto_all[col_insee].astype(str) == CODE_INSEE].copy()
-print(f'✅ {len(friches)} friches à {CODE_INSEE}')
-
-# Géolocalisation
-col_pt = next((c for c in friches.columns if friches[c].astype(str).str.contains('POINT', na=False).any()), None)
-col_lat = next((c for c in friches.columns if c.lower() in ('lat','latitude')), None)
-col_lon = next((c for c in friches.columns if c.lower() in ('lon','lng','longitude')), None)
-
-if col_pt:
-    friches['geometry'] = friches[col_pt].apply(
-        lambda x: shapely_wkt.loads(str(x)) if pd.notna(x) and 'POINT' in str(x) else None)
-    gdf_friches = gpd.GeoDataFrame(friches.dropna(subset=['geometry']), crs='EPSG:4326')
-elif col_lat and col_lon:
-    friches['_lat'] = pd.to_numeric(friches[col_lat], errors='coerce')
-    friches['_lon'] = pd.to_numeric(friches[col_lon], errors='coerce')
-    friches = friches.dropna(subset=['_lat','_lon'])
-    gdf_friches = gpd.GeoDataFrame(
-        friches,
-        geometry=gpd.points_from_xy(friches['_lon'], friches['_lat']),
-        crs='EPSG:4326'
-    )
-else:
+if len(carto_all) == 0:
+    col_insee = col_nom = col_adr = col_surf = col_type = col_statut = col_url = col_prop = None
+    friches = pd.DataFrame()
     gdf_friches = gpd.GeoDataFrame()
+    print('⚠️  Cartofriches non disponible — calque friches vide')
+else:
+    col_insee  = next((c for c in carto_all.columns if 'insee'   in c.lower()), None)
+    col_nom    = next((c for c in carto_all.columns if 'nom'     in c.lower() and 'site' in c.lower()), None)
+    col_adr    = next((c for c in carto_all.columns if 'adresse' in c.lower()), None)
+    col_surf   = next((c for c in carto_all.columns if 'surface' in c.lower()), None)
+    col_type   = next((c for c in carto_all.columns if 'type'    in c.lower() and 'site' in c.lower()), None)
+    col_statut = next((c for c in carto_all.columns if 'statut'  in c.lower()), None)
+    col_url    = next((c for c in carto_all.columns if 'url'     in c.lower()), None)
+    col_prop   = next((c for c in carto_all.columns if 'proprio' in c.lower() or 'proprietaire' in c.lower()), None)
 
-if len(gdf_friches) > 0:
-    print(f'✅ {len(gdf_friches)} friches géolocalisées')
+    friches = carto_all[carto_all[col_insee].astype(str) == CODE_INSEE].copy() if col_insee else pd.DataFrame()
+    print(f'  {len(friches)} friche(s) à {CODE_INSEE}')
+
+    # Géolocalisation
+    col_pt  = next((c for c in friches.columns if friches[c].astype(str).str.contains('POINT', na=False).any()), None) if len(friches) > 0 else None
+    col_lat = next((c for c in friches.columns if c.lower() in ('lat','latitude')), None)  if len(friches) > 0 else None
+    col_lon = next((c for c in friches.columns if c.lower() in ('lon','lng','longitude')), None) if len(friches) > 0 else None
+
+    if len(friches) == 0:
+        gdf_friches = gpd.GeoDataFrame()
+        print('  ℹ️  Aucune friche pour cette commune')
+    elif col_pt:
+        friches['geometry'] = friches[col_pt].apply(
+            lambda x: shapely_wkt.loads(str(x)) if pd.notna(x) and 'POINT' in str(x) else None)
+        gdf_friches = gpd.GeoDataFrame(friches.dropna(subset=['geometry']), crs='EPSG:4326')
+    elif col_lat and col_lon:
+        friches['_lat'] = pd.to_numeric(friches[col_lat], errors='coerce')
+        friches['_lon'] = pd.to_numeric(friches[col_lon], errors='coerce')
+        friches = friches.dropna(subset=['_lat','_lon'])
+        gdf_friches = gpd.GeoDataFrame(
+            friches,
+            geometry=gpd.points_from_xy(friches['_lon'], friches['_lat']),
+            crs='EPSG:4326'
+        )
+    else:
+        gdf_friches = gpd.GeoDataFrame()
+        print('  ⚠️  Pas de coordonnées dans Cartofriches')
+
+    if len(gdf_friches) > 0:
+        print(f'✅ {len(gdf_friches)} friches géolocalisées')
 
 # ══════════════════════════════════════════════════════
 # DVF 2014–2023
@@ -518,19 +588,51 @@ for annee in range(ANNEE_DVF_DEBUT, ANNEE_DVF_FIN + 1):
                 df = df[
                     df['nature_mutation'].isin([
                         'Vente','Adjudication','Expropriation',
-                        'Donation','Echange','Vente en l\'état futur d\'achèvement'
+                        'Donation','Echange',"Vente en l'état futur d'achèvement"
                     ])
                 ].copy()
             dvf_frames.append(df)
             dvf_stats.append({'annee': annee, 'status': 200, 'rows': len(df)})
-            print(f'  {annee} ✅ {len(df)} mutations (maisons/terrains)')
+            print(f'  {annee} ✅ {len(df)} mutations')
+        elif r.status_code == 404:
+            dvf_stats.append({'annee': annee, 'status': 404, 'rows': 0})
+            print(f'  {annee} ℹ️  Fichier absent')
+        elif r.status_code == 429:
+            print(f'  {annee} ⚠️  Rate limit — attente 30s...')
+            time.sleep(30)
+            r2 = requests.get(url, timeout=30)
+            if r2.status_code == 200:
+                df = pd.read_csv(io.StringIO(r2.text), low_memory=False)
+                cols_keep = [c for c in [
+                    'id_parcelle','date_mutation','nature_mutation',
+                    'nature_culture','valeur_fonciere','surface_reelle_bati'
+                ] if c in df.columns]
+                df = df[cols_keep].copy()
+                if 'nature_culture' in df.columns:
+                    df = df[
+                        df['nature_culture'].isin(NATURES_OK) |
+                        df['nature_culture'].isna()
+                    ].copy()
+                if 'nature_mutation' in df.columns:
+                    df = df[
+                        df['nature_mutation'].isin([
+                            'Vente','Adjudication','Expropriation',
+                            'Donation','Echange',"Vente en l'état futur d'achèvement"
+                        ])
+                    ].copy()
+                dvf_frames.append(df)
+                dvf_stats.append({'annee': annee, 'status': 200, 'rows': len(df)})
+                print(f'  {annee} ✅ Réessai ok — {len(df)} mutations')
+            else:
+                dvf_stats.append({'annee': annee, 'status': r2.status_code, 'rows': 0})
+                print(f'  {annee} ❌ {r2.status_code} après réessai')
         else:
             dvf_stats.append({'annee': annee, 'status': r.status_code, 'rows': 0})
             print(f'  {annee} ❌ {r.status_code}')
     except Exception as e:
         dvf_stats.append({'annee': annee, 'status': 'ERR', 'rows': 0})
         print(f'  {annee} ❌ {str(e)[:50]}')
-    time.sleep(0.3)
+    time.sleep(1)
 
 annees_dvf_dispo = [int(x['annee']) for x in dvf_stats if x['status'] == 200]
 annees_dvf_ko = [f"{x['annee']} ({x['status']})" for x in dvf_stats if x['status'] != 200]
@@ -665,7 +767,8 @@ dc_pts['geometry'] = dc_pts.geometry.centroid
 dc_parc = gpd.sjoin(
     dc_pts[['geometry','hauteur','ecart_max','haut_voisin_max']],
     parc_pp[['geometry','cle','section','numero','contenance','parc_area',
-              'emprise_ratio','compacite','denomination','siren']],
+              'emprise_ratio','compacite','denomination','siren',
+              'derniere_mutation_date','derniere_mutation_type']],
     how='inner', predicate='within'
 ).drop(columns='index_right', errors='ignore')
 dc_parc = dc_parc.sort_values('ecart_max', ascending=False).drop_duplicates(subset='cle', keep='first').copy()
@@ -702,6 +805,14 @@ masque_pub = candidats['denomination'].str.upper().apply(
 )
 candidats    = candidats[~masque_pub].copy()
 parc_vacants = candidats.merge(parc_geom, on='cle', how='left').copy()
+if len(dvf_last) > 0:
+    parc_vacants = parc_vacants.merge(
+        dvf_last[['cle', 'derniere_mutation_date', 'derniere_mutation_type']],
+        on='cle', how='left'
+    )
+else:
+    parc_vacants['derniere_mutation_date'] = pd.NaT
+    parc_vacants['derniere_mutation_type'] = ''
 parc_vacants['categorie'] = 'Bien vacant'
 print(f'  🟤 {len(parc_vacants)} candidats vacants (Signal Fort uniquement)')
 
@@ -711,18 +822,18 @@ total_affiche = len(dc_parc) + len(vides) + len(sous) + len(gdf_friches)
 print(f'\n✅ Total affiché : {total_affiche} opportunités (hors vacants Signal Fort)')
 
 # ══════════════════════════════════════════════════════
-# ALERTE COMPLÉMENTAIRE — score simple
+# SIGNAL FORT — score par cumul de signaux
 #
-# +1  Aucune vente DVF sur période disponible
+# +1  Aucune vente DVF sur période fiable
 # +1  Démembrement (nu-proprio + usufruitier)
+# +1  Répertorié dans Cartofriches
+# +1  Pleine propriété société (SIREN connu)
 #
-# 2 points = !!
+# Seuil : SIGNAL_FORT_SEUIL signaux → ping rouge
 # ══════════════════════════════════════════════════════
-print('Calcul alertes complémentaires...')
+print('Calcul Signal Fort...')
 
-# Fix 3 — Récupérer la clé cadastrale des friches via jointure spatiale
-# Cartofriches ne contient pas de clé parcelle — on la retrouve
-# en cherchant quelle parcelle contient le point GPS de chaque friche
+# Récupérer la clé cadastrale des friches via jointure spatiale
 cles_friches = set()
 if len(gdf_friches) > 0:
     try:
@@ -738,29 +849,37 @@ if len(gdf_friches) > 0:
     except Exception as e:
         print(f'  ⚠️ Jointure friches/parcelles : {e}')
 
-# Fix 4 — Score différencié selon la catégorie
 # Les vacants sont déjà filtrés par DVF=0 → ce signal ne les discrimine pas
 # On ne le compte donc que pour les autres catégories
-def score_signal_fort(cle, compter_dvf=True):
+def score_signal_fort(cle, siren='', compter_dvf=True):
     score = 0
     if compter_dvf and dvf_alerte_active and cle not in cles_avec_mutation:
         score += 1
     if cle in cles_demembrement:
-        score += 1
+        score += 1  # Succession potentiellement bloquée
+    if cle in cles_friches:
+        score += 1  # Répertoriée comme friche
+    if siren and str(siren) not in ('', 'nan'):
+        score += 1  # Propriétaire société identifiée
     return score
+
 
 def ajouter_score(df, compter_dvf=True):
     df = df.copy()
     df['signal_fort_score'] = df.apply(
-        lambda r: score_signal_fort(r.get('cle', ''), compter_dvf), axis=1
+        lambda r: score_signal_fort(
+            r.get('cle', ''), r.get('siren', ''), compter_dvf
+        ), axis=1
     )
-    df['signal_fort'] = df['signal_fort_score'] >= ALERTE_MIN_SEUIL
-    df['signal_fort_badge'] = df['signal_fort_score'].map({1: '!', 2: '!!'}).fillna('')
+    df['signal_fort'] = df['signal_fort_score'] >= SIGNAL_FORT_SEUIL
     return df
 
-dc_parc = ajouter_score(dc_parc, compter_dvf=True)
-vides   = ajouter_score(vides,   compter_dvf=True)
-sous    = ajouter_score(sous,    compter_dvf=True)
+
+dc_parc      = ajouter_score(dc_parc,      compter_dvf=True)
+vides        = ajouter_score(vides,         compter_dvf=True)
+sous         = ajouter_score(sous,          compter_dvf=True)
+parc_vacants = ajouter_score(parc_vacants,  compter_dvf=False)  # déjà filtré
+vac_fort     = parc_vacants[parc_vacants['signal_fort_score'] >= SIGNAL_FORT_SEUIL].copy()
 
 
 def geocoder_df(df):
@@ -808,16 +927,15 @@ def geocoder_df(df):
 
 
 print('Géocodage...')
-dc_parc      = geocoder_df(dc_parc)
-vides        = geocoder_df(vides)
-sous         = geocoder_df(sous)
-parc_vacants = geocoder_df(parc_vacants)
+dc_parc   = geocoder_df(dc_parc)
+vides     = geocoder_df(vides)
+sous      = geocoder_df(sous)
+vac_fort  = geocoder_df(vac_fort)
 if len(gdf_friches) > 0:
     gdf_friches = geocoder_df(gdf_friches)
 print('✅ Adresses récupérées')
 
-# Associer chaque friche à sa parcelle cadastrale pour l'afficher
-# comme une vraie grande catégorie rouge, au même titre que les autres.
+# Associer chaque friche à sa parcelle cadastrale
 friche_parc_map = {}
 if len(gdf_friches) > 0:
     try:
@@ -836,28 +954,32 @@ if len(gdf_friches) > 0:
     except Exception as e:
         print(f'  ⚠️ Association friches/parcelles échouée : {e}')
 
-# Score d'alerte sur les friches via leur parcelle associée
 if len(gdf_friches) > 0:
     gdf_friches = gdf_friches.copy()
     gdf_friches['cle'] = gdf_friches.index.map(lambda i: friche_parc_map.get(i, {}).get('cle', ''))
+    gdf_friches['section'] = gdf_friches.index.map(lambda i: friche_parc_map.get(i, {}).get('section', ''))
+    gdf_friches['numero'] = gdf_friches.index.map(lambda i: friche_parc_map.get(i, {}).get('numero', ''))
+    gdf_friches['contenance'] = gdf_friches.index.map(lambda i: friche_parc_map.get(i, {}).get('contenance', np.nan))
+    gdf_friches['denomination'] = gdf_friches.index.map(lambda i: friche_parc_map.get(i, {}).get('denomination', ''))
+    gdf_friches['siren'] = gdf_friches.index.map(lambda i: friche_parc_map.get(i, {}).get('siren', ''))
+    gdf_friches['derniere_mutation_date'] = gdf_friches.index.map(lambda i: friche_parc_map.get(i, {}).get('derniere_mutation_date', pd.NaT))
+    gdf_friches['derniere_mutation_type'] = gdf_friches.index.map(lambda i: friche_parc_map.get(i, {}).get('derniere_mutation_type', ''))
+    gdf_friches['geom_parcelle'] = gdf_friches.index.map(lambda i: friche_parc_map.get(i, {}).get('geom_parcelle'))
     gdf_friches = gdf_friches[~gdf_friches['cle'].isin(cles_achat_recent)].copy()
-    friche_parc_map = {
-        k: v for k, v in friche_parc_map.items()
-        if str(v.get('cle', '')) not in cles_achat_recent
-    }
+    friche_parc_map = {k: v for k, v in friche_parc_map.items() if k in set(gdf_friches.index)}
     gdf_friches = ajouter_score(gdf_friches, compter_dvf=True)
 else:
-    gdf_friches['signal_fort_score'] = []
-    gdf_friches['signal_fort'] = []
-    gdf_friches['signal_fort_badge'] = []
+    gdf_friches['signal_fort_score'] = pd.Series(dtype='int64')
+    gdf_friches['signal_fort'] = pd.Series(dtype='bool')
 
 nb_fort = int(sum([
     dc_parc['signal_fort'].sum(),
     vides['signal_fort'].sum(),
     sous['signal_fort'].sum(),
+    vac_fort['signal_fort'].sum(),
     gdf_friches['signal_fort'].sum() if 'signal_fort' in gdf_friches.columns else 0
 ]))
-print(f'✅ {nb_fort} biens avec alerte complémentaire (!! uniquement)')
+print(f'✅ {nb_fort} biens avec Signal Fort (≥{SIGNAL_FORT_SEUIL} signaux)')
 
 
 def niveau(h):
@@ -900,24 +1022,23 @@ folium.TileLayer(
     attr='© IGN', name='Parcelles IGN', overlay=True, control=True, opacity=0.55
 ).add_to(carte)
 
-# CSS badge alerte rose — injecté une seule fois dans la page
+# CSS animation ping rouge — injecté une seule fois dans la page
 carte.get_root().html.add_child(folium.Element("""
 <style>
-.badge-alerte {
-  width: 18px; height: 18px;
-  background: #EC4899;
-  color: white;
+@keyframes ping {
+  0%   { transform: scale(1);   opacity: 1; }
+  80%  { transform: scale(2.5); opacity: 0; }
+  100% { transform: scale(2.5); opacity: 0; }
+}
+.ping-rouge {
+  width: 14px; height: 14px;
+  background: #DC2626;
   border-radius: 50%;
   border: 2px solid white;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-family: Arial;
-  font-size: 12px;
-  font-weight: bold;
-  box-shadow: 0 1px 6px rgba(0,0,0,0.35);
+  box-shadow: 0 0 0 0 rgba(220,38,38,0.6);
+  animation: ping 1.4s ease-out infinite;
   position: absolute;
-  top: -20px; left: -9px;
+  top: -18px; left: -7px;
   pointer-events: none;
   z-index: 9999;
 }
@@ -925,39 +1046,13 @@ carte.get_root().html.add_child(folium.Element("""
 """))
 
 fg_dc  = folium.FeatureGroup(name=f'🟠 Dents creuses ({len(dc_parc)})', show=True)
-fg_vid = folium.FeatureGroup(name=f'🟢 Terrains vides stricts ({len(vides)})', show=True)
-fg_sou = folium.FeatureGroup(name=f'🔵 Sous-exploités filtrés ({len(sous)})', show=True)
+fg_vid = folium.FeatureGroup(name=f'🔵 Terrains vides stricts ({len(vides)})', show=True)
+fg_sou = folium.FeatureGroup(name=f'🟣 Sous-exploités filtrés ({len(sous)})', show=True)
 fg_fri = folium.FeatureGroup(name=f'🔴 Friches ({len(gdf_friches)})', show=True)
-fg_fort = folium.FeatureGroup(name=f'🩷 Alertes complémentaires ({nb_fort})', show=True)
+fg_fort = folium.FeatureGroup(name=f'🚨 Signal Fort ({nb_fort})', show=True)
 
 
-def ajouter_alerte(lat, lon, fg_fort_ref, badge='!', html=None, tooltip=None):
-    if fg_fort_ref is None or not badge:
-        return
-    badge_html = f'<div class="badge-alerte">{badge}</div>'
-    if html:
-        folium.Marker(
-            [lat, lon],
-            popup=folium.Popup(html, max_width=330),
-            tooltip=tooltip or 'Alerte complémentaire',
-            icon=folium.DivIcon(
-                html=badge_html,
-                icon_size=(18, 18),
-                icon_anchor=(9, 30)
-            )
-        ).add_to(fg_fort_ref)
-    else:
-        folium.Marker(
-            [lat, lon],
-            icon=folium.DivIcon(
-                html=badge_html,
-                icon_size=(18, 18),
-                icon_anchor=(9, 30)
-            )
-        ).add_to(fg_fort_ref)
-
-
-def ajouter(fg, gp, lat, lon, coul, col_f, icone, html, tip, sec, num, fort=False, badge='', fg_fort_ref=None):
+def ajouter(fg, gp, lat, lon, coul, col_f, icone, html, tip, sec, num, fort=False, fg_fort_ref=None):
     geom_wgs = gpd.GeoSeries([gp], crs='EPSG:2154').to_crs('EPSG:4326').iloc[0]
     folium.GeoJson(
         geom_wgs.__geo_interface__,
@@ -980,8 +1075,17 @@ def ajouter(fg, gp, lat, lon, coul, col_f, icone, html, tip, sec, num, fort=Fals
             icon_size=(60,18), icon_anchor=(0,0)
         )
     ).add_to(fg)
-    if fort is True and fg_fort_ref is not None and badge:
-        ajouter_alerte(lat, lon, fg_fort_ref, badge=badge)
+    # Fix 1 — fg_fort passé explicitement, pas pris depuis le contexte global
+    # Fix 5 — comparaison explicite au lieu de bool() fragile
+    if fort is True and fg_fort_ref is not None:
+        folium.Marker(
+            [lat, lon],
+            icon=folium.DivIcon(
+                html='<div class="ping-rouge"></div>',
+                icon_size=(14, 14),
+                icon_anchor=(7, 28)
+            )
+        ).add_to(fg_fort_ref)
 
 
 def get_gp_latlon(row):
@@ -1027,7 +1131,7 @@ for rang, (_, row) in enumerate(dc_parc.iterrows(), 1):
             f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a></div>"
         )
         ajouter(fg_dc,gp,lat,lon,COUL_DC,'orange','arrow-up',html,f'#{rang} Dent creuse | {adr}',sec,num,
-                fort=row.get('signal_fort_score',0)>=ALERTE_MIN_SEUIL, badge=row.get('signal_fort_badge',''), fg_fort_ref=fg_fort)
+                fort=row.get('signal_fort_score',0)>=SIGNAL_FORT_SEUIL, fg_fort_ref=fg_fort)
     except Exception as e:
         print(f'  ⚠️ DC {rang}: {e}')
 
@@ -1056,8 +1160,8 @@ for rang, (_, row) in enumerate(vides.iterrows(), 1):
             f"<b>Dernière mutation :</b> {mut}<br>"
             f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a></div>"
         )
-        ajouter(fg_vid,gp,lat,lon,COUL_VIDE,'green','tint',html,f'#{rang} Vide | {adr}',sec,num,
-                fort=row.get('signal_fort_score',0)>=ALERTE_MIN_SEUIL, badge=row.get('signal_fort_badge',''), fg_fort_ref=fg_fort)
+        ajouter(fg_vid,gp,lat,lon,COUL_VIDE,'blue','tint',html,f'#{rang} Vide | {adr}',sec,num,
+                fort=row.get('signal_fort_score',0)>=SIGNAL_FORT_SEUIL, fg_fort_ref=fg_fort)
     except Exception as e:
         print(f'  ⚠️ Vide {rang}: {e}')
 
@@ -1089,8 +1193,8 @@ for rang, (_, row) in enumerate(sous.iterrows(), 1):
             f"<b>Dernière mutation :</b> {mut}<br>"
             f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a></div>"
         )
-        ajouter(fg_sou,gp,lat,lon,COUL_SOUS,'blue','building',html,f'#{rang} Sous-exp. | {adr}',sec,num,
-                fort=row.get('signal_fort_score',0)>=ALERTE_MIN_SEUIL, badge=row.get('signal_fort_badge',''), fg_fort_ref=fg_fort)
+        ajouter(fg_sou,gp,lat,lon,COUL_SOUS,'purple','building',html,f'#{rang} Sous-exp. | {adr}',sec,num,
+                fort=row.get('signal_fort_score',0)>=SIGNAL_FORT_SEUIL, fg_fort_ref=fg_fort)
     except Exception as e:
         print(f'  ⚠️ Sous {rang}: {e}')
 
@@ -1171,29 +1275,71 @@ for rang, (idx, row) in enumerate(gdf_friches.iterrows(), 1):
                 style_function=lambda x: {'color': COUL_FRICHE, 'weight': 2, 'fillOpacity': 0.15}
             ).add_to(fg_fri)
 
-        if row.get('signal_fort_score', 0) >= ALERTE_MIN_SEUIL:
-            badge = row.get('signal_fort_badge', '!')
-            signaux = []
-            if dvf_alerte_active and row.get('cle', '') and row.get('cle', '') not in cles_avec_mutation:
-                signaux.append(f'✓ Aucune vente DVF sur période disponible ({periode_dvf_label})')
-            if row.get('cle', '') in cles_demembrement:
-                signaux.append('✓ Démembrement (succession)')
-            alerte_html = (
-                f"<div style='font-family:Arial;font-size:13px;min-width:280px;line-height:1.9'>"
-                f"<b style='font-size:15px;color:#EC4899'>{badge} Alerte complémentaire</b><br>"
-                f"<b style='color:{COUL_FRICHE}'>Friche répertoriée</b><br>"
-                f"<a href='{gm}' target='_blank' style='color:#1a6fb5;font-weight:bold;text-decoration:none'>📍 {adr}</a><br><br>"
-                f"{f'<b>Parcelle :</b> {sec} n°{num} | <b>Surface parcelle :</b> {surf_parc} m²<br>' if sec or num else ''}"
-                f"{f'<b>Proprio parcelle :</b> {prop_parc}<br>' if prop_parc else ''}"
-                f"{f'<b>Dernière mutation :</b> {mut_parc}<br>' if sec or num else ''}"
-                f"<b>Site :</b> {nom}<br>"
-                f"<b>Type :</b> {typ} | <b>Statut :</b> {stat}<br>"
-                f"<hr style='margin:5px 0'>{'<br>'.join(signaux) if signaux else 'Alerte complémentaire'}"
-                f"</div>"
-            )
-            ajouter_alerte(lat, lon, fg_fort, badge=badge, html=alerte_html, tooltip=f'{badge} Alerte | Friche | {nom}')
+        if row.get('signal_fort_score', 0) >= SIGNAL_FORT_SEUIL:
+            folium.Marker(
+                [lat, lon],
+                icon=folium.DivIcon(
+                    html='<div class="ping-rouge"></div>',
+                    icon_size=(14, 14),
+                    icon_anchor=(7, 28)
+                )
+            ).add_to(fg_fort)
     except Exception as e:
         print(f'  ⚠️ Friche {rang}: {e}')
+
+# 🚨 Vacants Signal Fort — affichés directement dans fg_fort
+print(f'Vacants Signal Fort ({len(vac_fort)})...')
+for rang, (_, row) in enumerate(vac_fort.iterrows(), 1):
+    try:
+        sec   = str(row.get('section','')).strip()
+        num   = str(row.get('numero','')).strip()
+        surf  = int(row['contenance']) if pd.notna(row.get('contenance')) else '?'
+        adr   = str(row.get('adresse','') or 'Adresse inconnue')
+        prop  = str(row.get('denomination','Particulier'))
+        sir   = str(row.get('siren','') or '')
+        emp   = round(float(row.get('emprise_ratio',0) or 0)*100, 1)
+        score = int(row.get('signal_fort_score', 0))
+        cle   = row.get('cle','')
+        mut   = format_derniere_mutation(row.get('derniere_mutation_date'))
+        gp, lat, lon = get_gp_latlon(row)
+        ae = urllib.parse.quote(adr)
+        gm = f'https://www.google.com/maps/search/?api=1&query={ae}'
+        ge = f'https://earth.google.com/web/search/{ae}'
+        sir_h = f"<b>SIREN :</b> {sir}<br>" if sir and sir not in ('','nan') else ''
+
+        signaux = []
+        if cle in cles_demembrement: signaux.append('✓ Démembrement (succession)')
+        if cle in cles_friches:      signaux.append('✓ Friche répertoriée')
+        if sir and sir not in ('','nan'): signaux.append('✓ Société identifiée')
+        signaux.append(f'✓ Aucune vente DVF sur période disponible ({periode_dvf_label})' if dvf_alerte_active else '✓ Aucune vente DVF observée sur période partielle')
+        # Indivision — info seulement, pas dans le score
+        if cle in cles_multi_sans_synd:
+            signaux.append('ℹ️ Plusieurs entités sur la parcelle (sans syndic)')
+
+        html = (
+            f"<div style='font-family:Arial;font-size:13px;min-width:280px;line-height:1.9'>"
+            f"<b style='font-size:15px;color:#DC2626'>🚨 Signal Fort ({score} signaux)</b><br>"
+            f"<a href='{gm}' target='_blank' style='color:#1a6fb5;font-weight:bold;text-decoration:none'>📍 {adr}</a><br><br>"
+            f"<b>Parcelle :</b> {sec} n°{num} | <b>Surface :</b> {surf} m²<br>"
+            f"<b>Emprise bâtie :</b> {emp}%"
+            f"<hr style='margin:5px 0'><b>Proprio :</b> {prop} ({type_prop(prop,sir)})<br>{sir_h}"
+            f"<b>Dernière mutation :</b> {mut}<br>"
+            f"<hr style='margin:5px 0'>{'<br>'.join(signaux)}"
+            f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a></div>"
+        )
+        geom_wgs = gpd.GeoSeries([gp], crs='EPSG:2154').to_crs('EPSG:4326').iloc[0]
+        folium.GeoJson(
+            geom_wgs.__geo_interface__,
+            style_function=lambda x: {'color':'#DC2626','weight':2,'fillOpacity':0.4}
+        ).add_to(fg_fort)
+        folium.Marker(
+            [lat, lon],
+            popup=folium.Popup(html, max_width=330),
+            tooltip=f'🚨 Signal Fort | {adr} | {score} signaux',
+            icon=folium.Icon(color='red', icon='exclamation', prefix='fa')
+        ).add_to(fg_fort)
+    except Exception as e:
+        print(f'  ⚠️ Vacant fort {rang}: {e}')
 
 for fg in [fg_dc, fg_vid, fg_sou, fg_fri, fg_fort]:
     fg.add_to(carte)
@@ -1211,13 +1357,13 @@ carte.get_root().html.add_child(folium.Element(
     f"<span style='color:{COUL_SOUS}'>&#9679;</span> Sous-exploités filtrés {len(sous)}<br>"
     f"<span style='color:{COUL_FRICHE}'>&#9679;</span> Friches {len(gdf_friches)}<br>"
     f"<hr style='margin:6px 0'>"
-    f"<span style='color:#EC4899'>&#9679;</span> <b>Alertes complémentaires</b> {nb_fort}"
+    f"<span style='color:#DC2626'>&#9679;</span> <b>Signal Fort</b> {nb_fort}"
     f"<i style='color:#999;font-size:10px;display:block;margin-top:3px'>"
-    f"2 points = !!</i>"
+    f"≥{SIGNAL_FORT_SEUIL} signaux — ping rouge + marqueurs dédiés</i>"
     f"</div>"
 ))
 
-print(f'✅ Carte affichée — {total} opportunités + {nb_fort} alertes complémentaires (!! uniquement)')
+print(f'✅ Carte affichée — {total} opportunités + {nb_fort} Signal Fort')
 os.makedirs(os.path.dirname(OUTPUT_HTML), exist_ok=True)
 carte.save(OUTPUT_HTML)
 print(f'✅ HTML généré : {OUTPUT_HTML}')
@@ -1243,6 +1389,7 @@ try:
         (vides,      'Terrain vide'),
         (sous,       'Sous-exploité'),
         (gdf_friches,'Friche'),
+        (vac_fort,   'Signal Fort vacant'),
     ]:
         e = _prep_export(_df, _cat)
         if e is not None:
