@@ -484,6 +484,7 @@ if len(gdf_friches) > 0:
 # ══════════════════════════════════════════════════════
 print(f'DVF {ANNEE_DVF_DEBUT}–{ANNEE_DVF_FIN}...')
 dvf_frames = []
+dvf_stats = []
 
 for annee in range(ANNEE_DVF_DEBUT, ANNEE_DVF_FIN + 1):
     url = f'https://files.data.gouv.fr/geo-dvf/latest/csv/{annee}/communes/{DEPT}/{CODE_INSEE}.csv'
@@ -509,10 +510,13 @@ for annee in range(ANNEE_DVF_DEBUT, ANNEE_DVF_FIN + 1):
                     ])
                 ].copy()
             dvf_frames.append(df)
+            dvf_stats.append({'annee': annee, 'status': 200, 'rows': len(df)})
             print(f'  {annee} ✅ {len(df)} mutations (maisons/terrains)')
         else:
+            dvf_stats.append({'annee': annee, 'status': r.status_code, 'rows': 0})
             print(f'  {annee} ❌ {r.status_code}')
     except Exception as e:
+        dvf_stats.append({'annee': annee, 'status': 'ERR', 'rows': 0})
         print(f'  {annee} ❌ {str(e)[:50]}')
     time.sleep(0.3)
 
@@ -539,6 +543,14 @@ else:
     cles_avec_mutation = set()
     dvf_last = pd.DataFrame()
     print('⚠️ DVF non chargé')
+
+annees_ok = [str(x['annee']) for x in dvf_stats if x['status'] == 200]
+annees_ko = [f"{x['annee']} ({x['status']})" for x in dvf_stats if x['status'] != 200]
+print(f"DVF années OK : {', '.join(annees_ok) if annees_ok else 'aucune'}")
+if annees_ko:
+    print(f"DVF années manquantes / erreurs : {', '.join(annees_ko)}")
+else:
+    print('DVF : toutes les années 2014–2023 sont bien revenues pour cette commune')
 
 DATE_ACHAT_RECENTE = pd.Timestamp.today().normalize() - pd.DateOffset(years=5)
 if len(dvf_last) > 0:
@@ -1075,20 +1087,7 @@ for rang, (idx, row) in enumerate(gdf_friches.iterrows(), 1):
         ae = urllib.parse.quote(adr)
         gm = f'https://www.google.com/maps/search/?api=1&query={ae}'
         ge = f'https://earth.google.com/web/search/{ae}'
-        html = (
-            f"<div style='font-family:Arial;font-size:13px;min-width:270px;line-height:1.9'>"
-            f"<b style='font-size:15px;color:{COUL_FRICHE}'>#{rang} Friche répertoriée</b><br>"
-            f"<b>{nom}</b><br>"
-            f"<a href='{gm}' target='_blank' style='color:#1a6fb5;font-weight:bold;text-decoration:none'>📍 {adr}</a><br><br>"
-            f"<b>Type :</b> {typ} | <b>Statut :</b> {stat}<br>"
-            f"<b>Surface :</b> {surf} m² | <b>Proprio site :</b> {prop_f}<br>"
-            f"{f'<b>Proprio parcelle :</b> {prop_parc}<br>' if prop_parc else ''}"
-            f"{f'<b>Dernière mutation :</b> {mut_parc}<br>' if sec or num else ''}"
-            f"<b>Source :</b> Cartofriches CEREMA"
-            f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a>"
-            f"{'<br><br><a href=' + repr(url_f) + ' target=_blank style=font-size:11px;color:#666>Fiche →</a>' if url_f else ''}"
-            f"</div>"
-        )
+
         infos_parc = friche_parc_map.get(idx, {})
         gp = infos_parc.get('geom_parcelle')
         sec = str(infos_parc.get('section', '') or '').strip()
@@ -1098,15 +1097,33 @@ for rang, (idx, row) in enumerate(gdf_friches.iterrows(), 1):
         prop_parc = str(infos_parc.get('denomination', '') or '').strip()
         mut_parc = format_derniere_mutation(infos_parc.get('derniere_mutation_date'))
 
+        html = (
+            f"<div style='font-family:Arial;font-size:13px;min-width:270px;line-height:1.9'>"
+            f"<b style='font-size:15px;color:{COUL_FRICHE}'>#{rang} Friche répertoriée</b><br>"
+            f"<b>{nom}</b><br>"
+            f"<a href='{gm}' target='_blank' style='color:#1a6fb5;font-weight:bold;text-decoration:none'>📍 {adr}</a><br><br>"
+            f"{f'<b>Parcelle :</b> {sec} n°{num} | <b>Surface parcelle :</b> {surf_parc} m²<br>' if sec or num else ''}"
+            f"<b>Type :</b> {typ} | <b>Statut :</b> {stat}<br>"
+            f"<b>Surface site :</b> {surf} m² | <b>Proprio site :</b> {prop_f}<br>"
+            f"{f'<b>Proprio parcelle :</b> {prop_parc}<br>' if prop_parc else ''}"
+            f"{f'<b>Dernière mutation :</b> {mut_parc}<br>' if sec or num else ''}"
+            f"<b>Source :</b> Cartofriches CEREMA"
+            f"<hr style='margin:5px 0'><a href='{ge}' target='_blank' style='background:#1a73e8;color:white;padding:5px 12px;border-radius:6px;text-decoration:none;font-size:12px'>🌍 Google Earth</a>"
+            f"{'<br><br><a href=' + repr(url_f) + ' target=_blank style=font-size:11px;color:#666>Fiche →</a>' if url_f else ''}"
+            f"</div>"
+        )
+
         if gp is not None:
             geom_wgs = gpd.GeoSeries([gp], crs='EPSG:2154').to_crs('EPSG:4326').iloc[0]
+            parc_cent = geom_wgs.centroid
+            poly_lat, poly_lon = round(parc_cent.y, 6), round(parc_cent.x, 6)
             folium.GeoJson(
                 geom_wgs.__geo_interface__,
                 style_function=lambda x: {'color': COUL_FRICHE, 'weight': 2, 'fillOpacity': 0.4}
             ).add_to(fg_fri)
             if sec or num:
                 folium.Marker(
-                    [lat, lon],
+                    [poly_lat, poly_lon],
                     icon=folium.DivIcon(
                         html=(f'<div style="font-family:Arial;font-size:9px;font-weight:bold;'
                               f'color:#1e293b;background:rgba(255,255,255,0.85);'
@@ -1116,6 +1133,7 @@ for rang, (idx, row) in enumerate(gdf_friches.iterrows(), 1):
                         icon_size=(60,18), icon_anchor=(0,0)
                     )
                 ).add_to(fg_fri)
+            lat, lon = poly_lat, poly_lon
 
         folium.Marker(
             [lat, lon], popup=folium.Popup(html, max_width=320),
